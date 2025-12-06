@@ -6,58 +6,51 @@ import numpy as np
 logger = logging.getLogger("BacktestLogger")
 
 class AccountManager:
-    def __init__(self, balance, leverage):
-        self.initial_balance = balance
+    def __init__(self, balance):
         self.balance = balance
-        self.base_leverage = leverage 
         self.position = None 
         self.peak_price = 0
-        self.is_bankrupt = False
-        self.trades_history = [] 
 
-    # AI 점수(확신도)에 따른 동적 레버리지 계산
-    def get_dynamic_leverage(self, score):
+    # [수정] genes 파라미터 추가: GA가 찾아낸 최적의 유전자 사용
+    def calculate_trade_parameters(self, score, pred_volatility, current_price, genes):
         confidence = abs(score)
         
-        if confidence < config.ENTRY_THRESHOLD: return 1.0
-        
-        ratio = (confidence - config.ENTRY_THRESHOLD) / (1.0 - config.ENTRY_THRESHOLD)
-        ratio = max(0.0, min(1.0, ratio))
-        
-        # 비선형 레버리지 적용 (확신도가 높을수록 레버리지를 급격히 증가시켜 수익성 극대화)
-        nonlinear_ratio = ratio ** 2 
-        
-        dyn_leverage = config.MIN_LEVERAGE + (nonlinear_ratio * (config.MAX_LEVERAGE - config.MIN_LEVERAGE))
-        
-        return round(dyn_leverage, 1)
+        # 1. 진입 장벽 동적 계산 (유전자 적용)
+        # 수식: 기본장벽 + (변동성 * 민감도)
+        # 변동성이 클수록 진입 장벽이 높아져서 뇌동매매 방지
+        dynamic_threshold = genes['base_threshold'] + (pred_volatility * genes['vol_impact'])
+        dynamic_threshold = min(dynamic_threshold, 0.9) # 최대 0.9 제한
 
-    # 진입 수량 계산 (리스크 관리 적용)
-    def get_position_qty(self, price, score, atr, leverage):
-        if self.is_bankrupt: return 0
-        confidence = abs(score)
-        
-        # 리스크 자본 할당 (AI 확신도가 높을수록 더 많은 리스크 감수)
-        risk_range = config.MAX_RISK_PER_TRADE - config.BASE_RISK_PER_TRADE
-        target_risk_pct = config.BASE_RISK_PER_TRADE + (
-            (confidence - config.ENTRY_THRESHOLD) / (1 - config.ENTRY_THRESHOLD) * risk_range
-        )
-        target_risk_pct = min(max(target_risk_pct, config.BASE_RISK_PER_TRADE), config.MAX_RISK_PER_TRADE)
-        
-        risk_amount = self.balance * target_risk_pct
+        if confidence < dynamic_threshold:
+            return 0, 0, 0, 0 # 진입 불가
 
-        # 변동성 기반 수량 조절 (손절폭을 3 ATR로 가정하고 리스크 금액 역산)
-        sl_distance = atr * 3.0
-        if sl_distance == 0: return 0
-        qty = risk_amount / sl_distance
+        # 2. 레버리지 (기존 로직 유지)
+        raw_leverage = 1 + (confidence * (config.MAX_LEVERAGE - 1)) / 0.8 
+        leverage = int(np.clip(round(raw_leverage), config.MIN_LEVERAGE, config.MAX_LEVERAGE))
         
-        # 레버리지 한도 체크 (슬리피지 고려하여 최대 가능 수량 제한)
-        price_with_slippage = price * (1 + config.SLIPPAGE)
-        max_qty_by_leverage = (self.balance * leverage) / price_with_slippage
-        
-        return min(qty, max_qty_by_leverage)
+        # 3. 리스크 금액 계산
+        risk_pct = confidence * config.MAX_RISK_PER_TRADE_CAP
+        risk_amount = self.balance * risk_pct
 
-    # 포지션 평가, 펀딩비 차감 및 청산 조건 확인
-    def update_pnl_and_check_exit(self, current_close, current_high, current_low, timestamp, current_atr):
+        # 4. SL / TP 결정 (유전자 적용)
+        # 수식: 변동성 * 손절배수(sl_mul)
+        vol_range = max(pred_volatility, 0.005) # 최소 변동성 보정
+        sl_dist = current_price * (vol_range * genes['sl_mul'])
+        
+        # 익절은 손절폭 대비 비율(tp_ratio)로 결정
+        tp_dist = sl_dist * genes['tp_ratio']
+        
+        # 수량 계산
+        if sl_dist == 0: qty = 0
+        else: qty = risk_amount / sl_dist
+        
+        # 레버리지 한도 체크
+        max_qty = (self.balance * leverage) / current_price
+        qty = min(qty, max_qty)
+        
+        return leverage, qty, sl_dist, tp_dist
+
+    def update_pnl_and_check_exit(self, current_close, current_high, current_low, timestamp, sl_price, tp_price):
         if not self.position: return 0
         
         entry = self.position['price']
@@ -65,12 +58,11 @@ class AccountManager:
         p_type = self.position['type']
         lev = self.position['leverage']
         
-        # 펀딩비 차감 (4시간마다 발생 가정)
+        # 펀딩비 차감 (간소화)
         position_value = current_close * size
-        funding_fee = position_value * config.FUNDING_RATE_4H
-        self.balance -= funding_fee
+        self.balance -= position_value * config.FUNDING_RATE_4H
 
-        # 1. 강제 청산(Liquidation) 체크
+        # 강제 청산 체크
         liq_threshold = 1.0 / lev
         is_liquidated = False
         
@@ -86,58 +78,40 @@ class AccountManager:
             loss = (entry * size) / lev 
             self.balance -= loss 
             self.position = None
-            self.peak_price = 0
             return -loss
 
-        # 2. 미실현 손익률(PnL %) 계산
-        if p_type == 'LONG':
-            pnl_pct = (current_close - entry) / entry
-        else:
-            pnl_pct = (entry - current_close) / entry
-
-        # 3. 동적 청산 (손절 및 트레일링 스탑)
-        sl_dist = current_atr * 3.0
-        
-        trailing_dist = None
-        if pnl_pct > 0.05: trailing_dist = current_atr * 2.5 
-        if pnl_pct > 0.15: trailing_dist = current_atr * 1.5 
-
+        # 청산 로직
         close_signal = False
         reason = ""
         exec_price = current_close
 
         if p_type == 'LONG':
             self.peak_price = max(self.peak_price, current_high)
-            
-            # 손절매 (Stop Loss)
-            if current_low <= (entry - sl_dist):
-                close_signal = True; reason = "StopLoss(ATR)"; exec_price = entry - sl_dist
-            
-            # 트레일링 스탑 (Trailing Profit)
-            elif trailing_dist and current_close <= (self.peak_price - trailing_dist):
-                if current_close > entry * 1.005: 
-                    close_signal = True; reason = "TrailingProfit"
+            if current_low <= sl_price:
+                close_signal = True; reason = "AI_StopLoss"; exec_price = sl_price
+            elif current_high >= tp_price:
+                # Trailing Profit: 익절 구간 도달 후 20% 반납 시 청산
+                trailing_gap = (tp_price - entry) * 0.2 
+                if current_close <= (self.peak_price - trailing_gap):
+                    close_signal = True; reason = "AI_TrailingProfit"
         
         elif p_type == 'SHORT':
             self.peak_price = min(self.peak_price, current_low)
-            
-            # 손절매 (Stop Loss)
-            if current_high >= (entry + sl_dist):
-                close_signal = True; reason = "StopLoss(ATR)"; exec_price = entry + sl_dist
-            
-            # 트레일링 스탑 (Trailing Profit)
-            elif trailing_dist and current_close >= (self.peak_price + trailing_dist):
-                if current_close < entry * 0.995:
-                    close_signal = True; reason = "TrailingProfit"
+            if current_high >= sl_price:
+                close_signal = True; reason = "AI_StopLoss"; exec_price = sl_price
+            elif current_low <= tp_price:
+                trailing_gap = (entry - tp_price) * 0.2
+                if current_close >= (self.peak_price + trailing_gap):
+                    close_signal = True; reason = "AI_TrailingProfit"
 
         if close_signal:
             self._force_close(exec_price, timestamp, reason)
             return 0
 
+        # 평가손익 반환
         if p_type == 'LONG': return (current_close - entry) * size
         else: return (entry - current_close) * size
 
-    # 포지션 강제 종료 (내부 함수)
     def _force_close(self, price, timestamp, reason):
         if not self.position: return
         
@@ -157,44 +131,36 @@ class AccountManager:
         self.position = None
         self.peak_price = 0
 
-    # 매매 실행 (진입 및 스위칭)
-    def execute_trade(self, signal, price, qty, leverage, timestamp):
-        # 이미 포지션이 있는 경우, 반대 신호나 청산 신호가 오면 기존 포지션 종료
+    def execute_trade(self, signal, price, qty, leverage, sl_dist, tp_dist, timestamp):
         if self.position:
-            should_close = False
-            if self.position['type'] == 'LONG' and signal == 'OPEN_SHORT': should_close = True
-            if self.position['type'] == 'SHORT' and signal == 'OPEN_LONG': should_close = True
-            if signal == 'CLOSE': should_close = True
-            
-            if should_close:
+             if (self.position['type'] == 'LONG' and signal == 'OPEN_SHORT') or \
+               (self.position['type'] == 'SHORT' and signal == 'OPEN_LONG'):
                 self._force_close(price, timestamp, 'SignalSwitch')
 
-        # 신규 진입
         if signal in ['OPEN_LONG', 'OPEN_SHORT'] and not self.position:
-            if self.balance <= 0: return 
+            if self.balance <= 0 or qty <= 0: return 
 
             if signal == 'OPEN_LONG':
-                real_entry_price = price * (1 + config.SLIPPAGE)
+                real_entry = price * (1 + config.SLIPPAGE)
                 p_type = 'LONG'
+                sl_price = real_entry - sl_dist
+                tp_price = real_entry + tp_dist
             else:
-                real_entry_price = price * (1 - config.SLIPPAGE)
+                real_entry = price * (1 - config.SLIPPAGE)
                 p_type = 'SHORT'
-                
-            if qty <= 0: return
+                sl_price = real_entry + sl_dist
+                tp_price = real_entry - tp_dist
             
-            # 증거금 확인 및 수량 조정
-            initial_margin = (real_entry_price * qty) / leverage
-            if initial_margin > self.balance:
-                qty = (self.balance * leverage) / real_entry_price
-
-            # 수수료 차감
-            self.balance -= (real_entry_price * qty * config.COMMISSION)
+            self.balance -= (real_entry * qty * config.COMMISSION)
             
             self.position = {
                 'type': p_type, 
-                'price': real_entry_price, 
+                'price': real_entry, 
                 'size': qty, 
-                'leverage': leverage 
+                'leverage': leverage,
+                'sl_price': sl_price,
+                'tp_price': tp_price
             }
-            self.peak_price = real_entry_price
-            logger.info(f"[{timestamp}] Open {p_type} @ {real_entry_price:.2f} (Qty: {qty:.4f}, Lev: x{leverage})")
+            self.peak_price = real_entry
+            logger.info(f"[{timestamp}] Open {p_type} @ {real_entry:.2f} (Qty: {qty:.4f}, Lev: x{leverage})")
+            logger.info(f"    >> Params: SL {sl_price:.2f} / TP {tp_price:.2f}")

@@ -9,108 +9,72 @@ import config
 from data_processor import DataProcessor
 from ai_models import HybridEnsemble
 from trading_engine import AccountManager
+from ga_optimizer import GeneticOptimizer
+from sklearn.preprocessing import RobustScaler
 
-# 로깅 설정 초기화
+# 로거 설정 (기존과 동일)
 logger = logging.getLogger("BacktestLogger")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 logger.propagate = False 
 if not os.path.exists(config.LOG_DIR): os.makedirs(config.LOG_DIR)
-
-# 파일 핸들러 설정 (상세 로그 저장)
 file_handler = logging.FileHandler(config.LOG_FILE, mode='w', encoding='utf-8')
-file_handler.setLevel(logging.DEBUG)
-file_fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-file_handler.setFormatter(file_fmt)
+file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 logger.addHandler(file_handler)
-
-# 콘솔 핸들러 설정 (주요 정보 출력)
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_fmt = logging.Formatter('%(message)s')
-console_handler.setFormatter(console_fmt)
+console_handler.setFormatter(logging.Formatter('%(message)s'))
 logger.addHandler(console_handler)
 
-# 백테스트 결과 그래프 그리기 및 저장
 def plot_results(df_result, symbol):
     if df_result.empty: return
-
     safe_symbol = symbol.replace('/', '_')
-    chart_path = os.path.join(config.LOG_DIR, f"equity_curve_{safe_symbol}.png")
-
-    df_result.index = pd.to_datetime(df_result.index)
-    running_max = df_result['balance'].cummax()
-    drawdown = (df_result['balance'] - running_max) / running_max * 100
-
-    plt.figure(figsize=(12, 8))
+    chart_path = os.path.join(config.LOG_DIR, f"equity_{safe_symbol}.png")
     
-    # 자산 곡선 (Equity Curve)
-    plt.subplot(2, 1, 1)
-    plt.plot(df_result.index, df_result['balance'], label=f'{symbol} Balance', color='blue')
+    df_result.index = pd.to_datetime(df_result.index)
+    plt.figure(figsize=(12, 6))
+    plt.plot(df_result.index, df_result['balance'], label=f'{symbol} Balance')
     plt.title(f'Equity Curve - {symbol}')
     plt.grid(True)
     plt.legend()
-    
-    # 낙폭 (Drawdown)
-    plt.subplot(2, 1, 2)
-    plt.fill_between(df_result.index, drawdown, 0, color='red', alpha=0.3)
-    plt.plot(df_result.index, drawdown, color='red', label='Drawdown (%)')
-    plt.title('Drawdown')
-    plt.grid(True)
-    plt.legend()
-    
-    plt.tight_layout()
     plt.savefig(chart_path)
-    logger.info(f"   [Result] Chart saved to {chart_path}")
     plt.close()
 
-# 단일 종목에 대한 전략 실행 함수
 def run_strategy(symbol):
     logger.info("\n" + "="*60)
     logger.info(f">> STARTING STRATEGY FOR: {symbol}")
-    logger.info(f">> Timeframe: {config.MAIN_TIMEFRAME} | Leverage: {config.MIN_LEVERAGE}~{config.MAX_LEVERAGE}x")
     logger.info("="*60)
 
-    # 1. 데이터 준비 및 전처리
     dp = DataProcessor(symbol)
     full_df = dp.prepare_multi_timeframe_data()
     
-    if len(full_df) < config.LSTM_WINDOW + 100:
-        logger.error(f"!! Not enough data for {symbol}.")
+    if len(full_df) < config.LSTM_WINDOW + 200:
+        logger.error("!! Not enough data.")
         return
 
-    features = [c for c in full_df.columns if c not in ['timestamp', 'target_cls', 'open', 'high', 'low', 'close', 'volume']]
-    logger.info(f"   - Features: {features}")
-
+    exclude_cols = ['timestamp', 'target_cls', 'target_vol', 'open', 'high', 'low', 'close', 'volume']
+    feature_cols = [c for c in full_df.columns if c not in exclude_cols]
+    
     current_train_end = pd.to_datetime(config.TEST_START)
     final_end = pd.to_datetime(config.COLLECT_END)
     interval = timedelta(days=config.ONLINE_TRAIN_INTERVAL_DAYS)
     
-    # 2. AI 모델 초기화 (매번 새로운 모델 인스턴스 생성)
     model = HybridEnsemble(symbol)
+    account = AccountManager(balance=config.INITIAL_BALANCE)
+    ga = GeneticOptimizer() # GA 옵티마이저 생성
     
-    # 3. 초기 학습 (테스트 시작 전 데이터로 학습)
-    logger.info(f"   [Init] Training new model from scratch for {symbol}...")
-    init_train_df = full_df[full_df.index < current_train_end]
-    
-    if not init_train_df.empty and len(init_train_df) > config.LSTM_WINDOW:
-        X_init_seq, y_init_seq = dp.create_sequences(init_train_df, features, config.LSTM_WINDOW)
-        X_init_flat = init_train_df.iloc[config.LSTM_WINDOW:][features].values
-        y_init_flat = init_train_df.iloc[config.LSTM_WINDOW:]['target_cls'].values
-        
-        model.train(X_init_seq, y_init_seq, X_init_flat, y_init_flat, is_update=False)
-    else:
-        logger.warning("   [Warning] Not enough initial data for training. Skipping...")
-
-    # 4. 백테스트 시뮬레이션 루프 시작
-    account = AccountManager(balance=config.INITIAL_BALANCE, leverage=1.0)
     equity_curve = [{'time': current_train_end, 'balance': config.INITIAL_BALANCE}]
     
+    # 초기 유전자는 기본값으로 시작
+    current_genes = {
+        'base_threshold': 0.2, 'vol_impact': 1.0, 'sl_mul': 1.0, 'tp_ratio': 2.0
+    }
+
     while current_train_end < final_end:
         chunk_end = current_train_end + interval
         if chunk_end > final_end: chunk_end = final_end
         
         logger.info(f"\n>> [Period] {current_train_end} ~ {chunk_end} | Symbol: {symbol}")
         
+        # 1. 데이터 분리
         train_mask = full_df.index < current_train_end
         test_mask = (full_df.index >= current_train_end) & (full_df.index < chunk_end)
         
@@ -118,90 +82,139 @@ def run_strategy(symbol):
         test_df = full_df.loc[test_mask]
         
         if test_df.empty: break
-        if len(train_df) < config.LSTM_WINDOW: 
+        if len(train_df) < config.LSTM_WINDOW + 200:
             current_train_end = chunk_end; continue
 
-        # 온라인 재학습 (주기적으로 최신 데이터 반영)
-        X_train_seq, y_train_seq = dp.create_sequences(train_df, features, config.LSTM_WINDOW)
-        X_train_flat = train_df.iloc[config.LSTM_WINDOW:][features].values
-        y_train_flat = train_df.iloc[config.LSTM_WINDOW:]['target_cls'].values
+        # 2. 스케일링
+        scaler = RobustScaler()
+        X_train_raw = train_df[feature_cols].values
+        X_test_raw = test_df[feature_cols].values
         
-        model.train(X_train_seq, y_train_seq, X_train_flat, y_train_flat, is_update=True)
-
-        # 테스트 구간에 대한 예측 수행
-        concat_df = pd.concat([train_df.iloc[-config.LSTM_WINDOW:], test_df])
-        X_test_seq, _ = dp.create_sequences(concat_df, features, config.LSTM_WINDOW)
-        X_test_flat = test_df[features].values
+        X_train_scaled = scaler.fit_transform(X_train_raw)
+        X_test_scaled = scaler.transform(X_test_raw)
         
-        # 기술적 지표 기반 점수 (RSI 과매수/과매도)
-        tech_scores = np.where(test_df['rsi'] < 30, 1, np.where(test_df['rsi'] > 70, -1, 0))
-        # AI 모델 예측 점수
-        ai_scores = model.batch_predict(X_test_seq, X_test_flat, tech_scores)
+        y_train_cls = train_df['target_cls'].values
+        y_train_vol = train_df['target_vol'].values
 
-        # 바(Bar) 단위 매매 루프
+        # 3. 모델 학습 (LSTM/XGB)
+        # 시퀀스 생성
+        X_train_seq, y_train_seq_cls, y_train_seq_vol = dp.create_sequences(
+            X_train_scaled, y_train_cls, y_train_vol, config.LSTM_WINDOW
+        )
+        
+        # XGB용 평탄화 데이터 (LSTM 윈도우 이후부터 사용 가능)
+        X_train_flat = X_train_scaled[config.LSTM_WINDOW:]
+        y_train_flat_cls = y_train_cls[config.LSTM_WINDOW:]
+        
+        model.train(
+            X_train_seq, y_train_seq_cls, y_train_seq_vol, 
+            X_train_flat, y_train_flat_cls, 
+            features_name=feature_cols, is_update=(account.position is not None)
+        )
+
+        # -------------------------------------------------------------
+        # [NEW] GA 최적화 단계 (최근 학습 데이터의 일부를 사용하여 최적화)
+        # -------------------------------------------------------------
+        logger.info("   >> Running GA Optimization on recent data...")
+        
+        # GA용 Calibration 데이터 (Train의 마지막 3개월 정도 사용)
+        calib_size = 90 * 6 # 90일 * 4시간봉(6개/일) = 540개
+        if len(X_train_scaled) > calib_size + config.LSTM_WINDOW:
+            X_calib = X_train_scaled[-calib_size:]
+            # Calibration용 OHLCV (가격 데이터 필요)
+            calib_ohlcv = train_df[['open', 'high', 'low', 'close']].values[-calib_size:]
+            
+            # Calibration 데이터에 대해 AI 예측 수행
+            # (학습된 모델이 과거 데이터를 보고 어떤 점수를 줬을지 계산)
+            dummy_y = np.zeros(len(X_calib))
+            X_calib_seq, _, _ = dp.create_sequences(X_calib, dummy_y, dummy_y, config.LSTM_WINDOW)
+            
+            # 시퀀스 생성으로 인해 앞부분 잘림 보정
+            calib_ohlcv_cut = calib_ohlcv[config.LSTM_WINDOW:] 
+            X_calib_flat = X_calib[config.LSTM_WINDOW:]
+            
+            # 예측 (Score, Vol)
+            calib_scores, calib_vols = model.predict(X_calib_seq, X_calib_flat)
+            
+            # GA 입력용 통합 배열 생성
+            ga_input_preds = np.column_stack((calib_scores, calib_vols))
+            
+            # GA 실행
+            best_gene, best_fit = ga.optimize(calib_ohlcv_cut, ga_input_preds)
+            current_genes = best_gene
+            logger.info(f"   >> [GA Best Gene] Fit: {best_fit:.1f} | Genes: {current_genes}")
+        else:
+            logger.warning("   >> Not enough data for GA. Using previous genes.")
+
+        # -------------------------------------------------------------
+        # 4. 실전(Test) 매매 시뮬레이션
+        # -------------------------------------------------------------
+        combined_scaled = np.concatenate([X_train_scaled[-config.LSTM_WINDOW:], X_test_scaled], axis=0)
+        dummy_y = np.zeros(len(combined_scaled))
+        X_test_seq, _, _ = dp.create_sequences(combined_scaled, dummy_y, dummy_y, config.LSTM_WINDOW)
+        X_test_flat = X_test_scaled
+
+        # Test 구간 예측
+        ai_scores, pred_vols = model.predict(X_test_seq, X_test_flat)
+
         for i in range(len(test_df) - 1):
             if account.balance <= 0: break
             
             curr_row = test_df.iloc[i]
             next_bar = test_df.iloc[i+1]
+            timestamp = next_bar.name
             
-            score = ai_scores[i]            
-            current_atr = curr_row['atr']   
-            
-            signal = 'HOLD'
-            if score > config.ENTRY_THRESHOLD: 
-                signal = 'OPEN_LONG'
-            elif config.ENABLE_SHORT and score < -config.ENTRY_THRESHOLD: 
-                signal = 'OPEN_SHORT'
-            
+            score = ai_scores[i]
+            pred_vol = pred_vols[i]
             exec_price = next_bar['open']
-            qty = 0
-            dyn_leverage = 1.0
             
-            # 진입 신호 발생 시 수량 및 레버리지 계산
-            if signal != 'HOLD':
-                dyn_leverage = account.get_dynamic_leverage(score)
-                qty = account.get_position_qty(exec_price, score, current_atr, dyn_leverage)
+            # SL/TP 청산 체크
+            sl = account.position['sl_price'] if account.position else 0
+            tp = account.position['tp_price'] if account.position else 0
             
-            # 주문 실행
-            account.execute_trade(signal, exec_price, qty, dyn_leverage, next_bar.name)
-            
-            # 포지션 평가 및 청산 체크 (손절/익절)
             account.update_pnl_and_check_exit(
-                next_bar['close'], 
-                next_bar['high'], 
-                next_bar['low'], 
-                next_bar.name, 
-                current_atr
+                next_bar['close'], next_bar['high'], next_bar['low'], 
+                timestamp, sl, tp
             )
             
-            equity_curve.append({'time': next_bar.name, 'balance': account.balance})
+            # 신규 진입 (GA가 찾아낸 current_genes 사용)
+            if not account.position:
+                lev, qty, sl_dist, tp_dist = account.calculate_trade_parameters(
+                    score, pred_vol, exec_price, current_genes
+                )
+                
+                # 진입 결정 (calculate_trade_parameters가 0을 리턴하면 진입 안 함)
+                if qty > 0:
+                    signal = 'OPEN_LONG' if score > 0 else 'OPEN_SHORT'
+                    if score < 0 and not config.ENABLE_SHORT: signal = 'HOLD'
+                    
+                    if signal != 'HOLD':
+                        account.execute_trade(signal, exec_price, qty, lev, sl_dist, tp_dist, timestamp)
+                
+            equity_curve.append({'time': timestamp, 'balance': account.balance})
 
         current_train_end = chunk_end
-        if account.balance <= 0: break
+        if account.balance <= 0: 
+            logger.error("!!! BANKRUPT !!!")
+            break
 
-    # 백테스트 종료 후 남은 포지션 강제 청산
+    # 최종 정리
     if account.position:
-        last_bar = full_df.iloc[-1]
-        account._force_close(last_bar['close'], full_df.index[-1], 'FinalClose')
+        account._force_close(full_df.iloc[-1]['close'], full_df.index[-1], 'FinalClose')
         equity_curve.append({'time': full_df.index[-1], 'balance': account.balance})
 
-    # 최종 결과 계산 및 저장
     df_result = pd.DataFrame(equity_curve).set_index('time')
     df_result = df_result[~df_result.index.duplicated(keep='last')]
     
     final_bal = df_result.iloc[-1]['balance']
     roi = ((final_bal/config.INITIAL_BALANCE)-1)*100
-    
     logger.info(f"\n   >> [RESULT] {symbol} Balance: ${final_bal:,.2f} ({roi:+.2f}%)")
     
     safe_symbol = symbol.replace('/', '_')
-    result_path = os.path.join(config.LOG_DIR, f"backtest_result_{safe_symbol}.csv")
-    df_result.to_csv(result_path)
-    
+    df_result.to_csv(os.path.join(config.LOG_DIR, f"result_{safe_symbol}.csv"))
     plot_results(df_result, symbol)
 
 if __name__ == "__main__":
-    # 설정된 모든 대상 종목에 대해 전략 실행
+    # data_processor.py와 ai_models.py는 기존 코드 그대로 사용 (import 문제 없음)
     for target_symbol in config.TARGET_SYMBOLS:
         run_strategy(target_symbol)

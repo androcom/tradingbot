@@ -3,105 +3,152 @@ import numpy as np
 import os
 import joblib
 import logging
-from xgboost import XGBClassifier
-from tensorflow.keras.models import Sequential, load_model
+import pandas as pd
+
+# [성능 최적화 1] 불필요한 TF 로그 제거
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import tensorflow as tf
+from tensorflow.keras import mixed_precision
+from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from tensorflow.keras.callbacks import Callback
+from xgboost import XGBClassifier
 from sklearn.utils.class_weight import compute_class_weight
 import config
 
 logger = logging.getLogger("BacktestLogger")
 
-# 학습 과정 중 로그를 출력하기 위한 콜백 클래스
+# [성능 최적화 2] GPU 메모리 동적 할당
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logger.info(f"   [System] GPU Memory Growth Enabled: {len(gpus)} GPUs")
+    except RuntimeError as e:
+        logger.error(f"   [System] GPU Setup Error: {e}")
+
+# [성능 최적화 3] Mixed Precision
+try:
+    policy = mixed_precision.Policy('mixed_float16')
+    mixed_precision.set_global_policy(policy)
+    logger.info("   [System] Mixed Precision (FP16) Enabled")
+except Exception as e:
+    logger.warning(f"   [System] Failed to set Mixed Precision: {e}")
+
+# [성능 최적화 4] XLA 활성화
+tf.config.optimizer.set_jit(True)
+
+
 class LoggingCallback(Callback):
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
         total_epochs = self.params.get('epochs', config.TRAIN_EPOCHS)
-        
-        # 학습의 시작(첫 에포크)과 끝(마지막 에포크)에만 로그를 출력하여 로그 양 조절
         if epoch == 0 or epoch == (total_epochs - 1):
-            logger.info(f"    Epoch {epoch+1}/{total_epochs} - loss: {logs.get('loss'):.4f} - accuracy: {logs.get('accuracy'):.4f}")
+            logger.info(f"    Epoch {epoch+1}/{total_epochs} - loss: {logs.get('loss'):.4f} - accuracy: {logs.get('cls_output_accuracy'):.4f}")
 
-# XGBoost와 LSTM을 결합한 하이브리드 앙상블 모델 클래스
 class HybridEnsemble:
     def __init__(self, symbol):
         self.symbol = symbol
         safe_symbol = symbol.replace('/', '_')
-        
-        # 모델 파일 저장 경로 설정
         self.xgb_path = os.path.join(config.MODEL_DIR, f'xgb_{safe_symbol}.pkl')
         self.lstm_path = os.path.join(config.MODEL_DIR, f'lstm_{safe_symbol}.h5')
 
-        # XGBoost 모델 초기화 (이전 학습된 모델을 불러오지 않고 새로 생성)
+        # XGBoost 모델 정의
         self.xgb_model = XGBClassifier(
-            n_estimators=100, max_depth=6, learning_rate=0.05,
+            n_estimators=200, max_depth=5, learning_rate=0.03,
             tree_method='hist', device='cuda',
             objective='multi:softprob', num_class=3, eval_metric='mlogloss'
         )
         self.lstm_model = None
 
-    # 학습된 모델들을 파일로 저장
     def save_models(self):
         joblib.dump(self.xgb_model, self.xgb_path)
         if self.lstm_model: self.lstm_model.save(self.lstm_path)
 
-    # LSTM 모델 구조 정의 및 컴파일
-    def build_lstm(self, input_shape):
-        model = Sequential()
-        model.add(Input(shape=input_shape))
-        model.add(LSTM(128, return_sequences=True))
-        model.add(Dropout(0.3))
-        model.add(LSTM(64, return_sequences=False))
-        model.add(Dropout(0.3))
-        model.add(Dense(3, activation='softmax'))
-        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    def build_multi_output_lstm(self, input_shape):
+        inputs = Input(shape=input_shape)
+        
+        x = LSTM(128, return_sequences=True)(inputs)
+        x = Dropout(0.3)(x)
+        x = LSTM(64, return_sequences=False)(x)
+        x = Dropout(0.3)(x)
+        
+        # Output 1: 방향 분류 (3 class)
+        out_cls = Dense(3, activation='softmax', name='cls_output', dtype='float32')(x)
+        
+        # Output 2: 변동성 예측 (Regression)
+        out_reg = Dense(1, activation='relu', name='reg_output', dtype='float32')(x)
+        
+        model = Model(inputs=inputs, outputs=[out_cls, out_reg])
+        
+        model.compile(
+            optimizer='adam', 
+            loss={'cls_output': 'sparse_categorical_crossentropy', 'reg_output': 'mse'},
+            loss_weights={'cls_output': 1.0, 'reg_output': 0.5},
+            metrics={'cls_output': 'accuracy'}
+        )
         return model
 
-    # 모델 학습 (XGBoost 및 LSTM)
-    def train(self, X_seq, y_seq, X_flat, y_flat, is_update=False):
-        # 클래스 불균형 처리를 위한 가중치 계산
-        classes = np.unique(y_flat)
-        if len(classes) < 2:
-            class_weight_dict = {c: 1.0 for c in classes}
-            sample_weights = np.ones(len(y_flat))
-        else:
-            weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_flat)
+    def train(self, X_seq, y_cls, y_vol, X_flat, y_flat_cls, features_name=None, is_update=False):
+        # 1. XGBoost 학습
+        classes = np.unique(y_flat_cls)
+        if len(classes) > 1:
+            weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_flat_cls)
             class_weight_dict = dict(zip(classes, weights))
-            sample_weights = np.array([class_weight_dict[y] for y in y_flat])
+            
+            # Short(0) / Long(2)에 가중치 3배 부여
+            if 0 in class_weight_dict: class_weight_dict[0] *= 3.0
+            if 2 in class_weight_dict: class_weight_dict[2] *= 3.0
+            
+            sample_weights_xgb = np.array([class_weight_dict[y] for y in y_flat_cls])
+            
+            # [오류 수정된 부분] self.xgb_ -> self.xgb_model
+            self.xgb_model.fit(X_flat, y_flat_cls, sample_weight=sample_weights_xgb)
+        else:
+             self.xgb_model.fit(X_flat, y_flat_cls)
 
-        # XGBoost 모델 학습
-        self.xgb_model.fit(X_flat, y_flat, sample_weight=sample_weights)
-        
-        # LSTM 모델이 없으면 생성
+        if features_name is not None and not is_update:
+            try:
+                importances = self.xgb_model.feature_importances_
+                feature_imp = pd.DataFrame(sorted(zip(importances, features_name)), columns=['Value','Feature'])
+                logger.info("\n[Model] Top 10 Important Features:")
+                logger.info(feature_imp.sort_values(by="Value", ascending=False).head(10).to_string(index=False))
+            except: pass
+
+        # 2. LSTM 학습
         if self.lstm_model is None:
-            self.lstm_model = self.build_lstm((X_seq.shape[1], X_seq.shape[2]))
+            self.lstm_model = self.build_multi_output_lstm((X_seq.shape[1], X_seq.shape[2]))
         
-        epochs = config.TRAIN_EPOCHS
+        # [수정] class_weight 오류 해결을 위해 sample_weight 사용
+        # 분류(cls_output)에만 가중치 적용 (Short/Long 중요도 상향)
+        cls_weight_map = {0: 3.0, 1: 1.0, 2: 3.0}
+        sample_weights_cls = np.array([cls_weight_map.get(y, 1.0) for y in y_cls])
         
-        logger.info(f"   >> LSTM Training ({epochs} epochs)...")
-        # LSTM 모델 학습
+        logger.info(f"   >> LSTM Training ({config.TRAIN_EPOCHS} epochs)...")
         self.lstm_model.fit(
-            X_seq, y_seq, epochs=epochs, batch_size=config.BATCH_SIZE, 
-            verbose=0, callbacks=[LoggingCallback()], class_weight=class_weight_dict
+            X_seq, 
+            {'cls_output': y_cls, 'reg_output': y_vol},
+            epochs=config.TRAIN_EPOCHS, 
+            batch_size=config.BATCH_SIZE, 
+            verbose=0,
+            # [핵심] 출력별 샘플 가중치 전달
+            sample_weight={'cls_output': sample_weights_cls}, 
+            callbacks=[LoggingCallback()]
         )
-        # 학습 완료 후 모델 저장
         self.save_models()
 
-    # 배치 예측 수행 (XGBoost와 LSTM 결과 앙상블)
-    def batch_predict(self, X_seq, X_flat, tech_scores):
-        # XGBoost 예측 확률 계산
+    def predict(self, X_seq, X_flat):
         xgb_probs = self.xgb_model.predict_proba(X_flat)
-        # 상승 확률(인덱스 2)에서 하락 확률(인덱스 0)을 뺀 점수 계산
         xgb_score = xgb_probs[:, 2] - xgb_probs[:, 0]
         
-        # LSTM 예측 확률 계산
-        lstm_probs = self.lstm_model.predict(X_seq, batch_size=config.BATCH_SIZE, verbose=0)
-        # 상승 확률(인덱스 2)에서 하락 확률(인덱스 0)을 뺀 점수 계산
-        lstm_score = lstm_probs[:, 2] - lstm_probs[:, 0]
+        lstm_preds = self.lstm_model.predict(X_seq, batch_size=config.BATCH_SIZE, verbose=0)
+        lstm_cls_probs = lstm_preds[0]
+        lstm_vol_pred = lstm_preds[1].flatten()
         
-        # 두 모델의 점수를 가중 합산하여 최종 점수 도출
-        final_scores = (
-            (xgb_score * config.W_XGB) +
-            (lstm_score * config.W_LSTM)
-        )
-        return final_scores
+        lstm_score = lstm_cls_probs[:, 2] - lstm_cls_probs[:, 0]
+        
+        final_score = (xgb_score * config.W_XGB) + (lstm_score * config.W_LSTM)
+        
+        return final_score, lstm_vol_pred
