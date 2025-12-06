@@ -1,0 +1,14 @@
+# 데이터 처리 및 분석 기본
+pandas
+numpy<2.0               # TensorFlow 구버전과의 호환성을 위해 2.0 미만으로 제한
+matplotlib              # 결과 시각화용
+
+# 거래소 API 및 기술적 분석
+ccxt                    # 거래소 데이터 수집 API
+ta                      # RSI, ATR, MACD 등 기술적 지표 계산 라이브러리
+
+# 머신러닝 모델
+tensorflow<2.11         # Windows 환경 GPU 안정성을 위한 버전 제한
+xgboost                 # XGBoost 모델
+scikit-learn            # 클래스 가중치 계산 (compute_class_weight)
+joblib                  # 모델 파일 저장/로드용
