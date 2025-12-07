@@ -6,51 +6,103 @@ import numpy as np
 logger = logging.getLogger("BacktestLogger")
 
 class AccountManager:
-    def __init__(self, balance):
+    def __init__(self, balance, leverage):
+        self.initial_balance = balance
         self.balance = balance
+        self.base_leverage = int(leverage)
         self.position = None 
         self.peak_price = 0
+        self.is_bankrupt = False
 
-    # [수정] genes 파라미터 추가: GA가 찾아낸 최적의 유전자 사용
-    def calculate_trade_parameters(self, score, pred_volatility, current_price, genes):
+    def get_dynamic_leverage(self, score, threshold):
+        confidence = abs(score)
+        if confidence < threshold: return 1
+        
+        ratio = (confidence - threshold) / (1.0 - threshold + 1e-9)
+        ratio = max(0.0, min(1.0, ratio))
+        
+        raw_lev = config.MIN_LEVERAGE + (ratio * (config.MAX_LEVERAGE - config.MIN_LEVERAGE))
+        return int(round(raw_lev))
+
+    def get_position_qty(self, price, score, atr, leverage, risk_scale, sl_mult):
+        if self.is_bankrupt or self.balance <= 0: return 0
         confidence = abs(score)
         
-        # 1. 진입 장벽 동적 계산 (유전자 적용)
-        # 수식: 기본장벽 + (변동성 * 민감도)
-        # 변동성이 클수록 진입 장벽이 높아져서 뇌동매매 방지
-        dynamic_threshold = genes['base_threshold'] + (pred_volatility * genes['vol_impact'])
-        dynamic_threshold = min(dynamic_threshold, 0.9) # 최대 0.9 제한
+        target_risk_pct = min(risk_scale, config.GLOBAL_RISK_LIMIT)
+        risk_amount = self.balance * target_risk_pct
+        
+        sl_distance = atr * sl_mult
+        if sl_distance == 0: return 0
+        
+        qty_risk = risk_amount / sl_distance
+        price_with_slippage = price * (1 + config.SLIPPAGE)
+        max_qty_lev = (self.balance * leverage) / price_with_slippage
+        
+        return min(qty_risk, max_qty_lev)
 
-        if confidence < dynamic_threshold:
-            return 0, 0, 0, 0 # 진입 불가
+    def check_exit_with_precision(self, candles_5m, entry, size, p_type, lev, sl_dist, tp_ratio):
+        """
+        [업데이트] 수익 극대화 트레일링 스탑 로직 적용
+        """
+        if candles_5m.empty: return False, 0, "", None
 
-        # 2. 레버리지 (기존 로직 유지)
-        raw_leverage = 1 + (confidence * (config.MAX_LEVERAGE - 1)) / 0.8 
-        leverage = int(np.clip(round(raw_leverage), config.MIN_LEVERAGE, config.MAX_LEVERAGE))
+        liq_threshold = 1.0 / float(lev)
+        if p_type == 'LONG':
+            liq_price = entry * (1 - liq_threshold + 0.005) 
+            current_stop_price = entry - sl_dist
+        else:
+            liq_price = entry * (1 + liq_threshold - 0.005)
+            current_stop_price = entry + sl_dist
+            
+        # 트레일링 활성화 가격 (기존 고정 TP 가격)
+        trailing_activation_price = (entry + (sl_dist * tp_ratio)) if p_type == 'LONG' else (entry - (sl_dist * tp_ratio))
+        is_trailing_active = False
         
-        # 3. 리스크 금액 계산
-        risk_pct = confidence * config.MAX_RISK_PER_TRADE_CAP
-        risk_amount = self.balance * risk_pct
+        # 최고점/최저점 추적
+        best_price = entry 
+        
+        for ts, row in candles_5m.iterrows():
+            curr_h = row['high']
+            curr_l = row['low']
+            
+            # 1. 청산 체크 (최우선)
+            if p_type == 'LONG' and curr_l <= liq_price: return True, liq_price, "LIQUIDATION", ts
+            if p_type == 'SHORT' and curr_h >= liq_price: return True, liq_price, "LIQUIDATION", ts
 
-        # 4. SL / TP 결정 (유전자 적용)
-        # 수식: 변동성 * 손절배수(sl_mul)
-        vol_range = max(pred_volatility, 0.005) # 최소 변동성 보정
-        sl_dist = current_price * (vol_range * genes['sl_mul'])
-        
-        # 익절은 손절폭 대비 비율(tp_ratio)로 결정
-        tp_dist = sl_dist * genes['tp_ratio']
-        
-        # 수량 계산
-        if sl_dist == 0: qty = 0
-        else: qty = risk_amount / sl_dist
-        
-        # 레버리지 한도 체크
-        max_qty = (self.balance * leverage) / current_price
-        qty = min(qty, max_qty)
-        
-        return leverage, qty, sl_dist, tp_dist
+            # 2. 트레일링 스탑 로직
+            if p_type == 'LONG':
+                if curr_h > best_price: best_price = curr_h
+                
+                # 목표 수익률 도달 시 트레일링 활성화
+                if not is_trailing_active and curr_h >= trailing_activation_price:
+                    is_trailing_active = True
+                
+                # 활성화 상태: 최고점 대비 0.5 * SL거리 만큼 여유를 두고 따라감
+                if is_trailing_active:
+                    new_stop = best_price - (sl_dist * 0.5)
+                    if new_stop > current_stop_price: current_stop_price = new_stop
+            
+            else: # SHORT
+                if curr_l < best_price: best_price = curr_l
+                
+                if not is_trailing_active and curr_l <= trailing_activation_price:
+                    is_trailing_active = True
+                    
+                if is_trailing_active:
+                    new_stop = best_price + (sl_dist * 0.5)
+                    if new_stop < current_stop_price: current_stop_price = new_stop
 
-    def update_pnl_and_check_exit(self, current_close, current_high, current_low, timestamp, sl_price, tp_price):
+            # 3. Stop Loss 체크 (트레일링 포함)
+            if p_type == 'LONG' and curr_l <= current_stop_price:
+                reason = "TrailingProfit" if is_trailing_active else "StopLoss"
+                return True, current_stop_price, reason, ts
+            if p_type == 'SHORT' and curr_h >= current_stop_price:
+                reason = "TrailingProfit" if is_trailing_active else "StopLoss"
+                return True, current_stop_price, reason, ts
+        
+        return False, 0, "", None
+
+    def update_pnl_and_check_exit(self, current_close, current_high, current_low, timestamp, current_atr, precision_candles=None, sl_mult=3.0, tp_ratio=2.0):
         if not self.position: return 0
         
         entry = self.position['price']
@@ -58,57 +110,50 @@ class AccountManager:
         p_type = self.position['type']
         lev = self.position['leverage']
         
-        # 펀딩비 차감 (간소화)
-        position_value = current_close * size
-        self.balance -= position_value * config.FUNDING_RATE_4H
+        funding_rate = config.FUNDING_RATE_4H / 4 if config.MAIN_TIMEFRAME == '1h' else config.FUNDING_RATE_4H
+        self.balance -= (current_close * size * funding_rate)
 
-        # 강제 청산 체크
-        liq_threshold = 1.0 / lev
-        is_liquidated = False
+        exit_triggered = False
+        exit_price = 0
+        exit_reason = ""
+        exit_time = timestamp
+
+        if precision_candles is not None and not precision_candles.empty:
+            is_closed, p_price, reason, p_time = self.check_exit_with_precision(
+                precision_candles, entry, size, p_type, lev, 
+                current_atr * sl_mult, tp_ratio
+            )
+            if is_closed:
+                exit_triggered = True
+                exit_price = p_price
+                exit_reason = reason
+                exit_time = p_time
         
-        if p_type == 'LONG':
-            liq_price = entry * (1 - liq_threshold)
-            if current_low <= liq_price: is_liquidated = True
-        else: 
-            liq_price = entry * (1 + liq_threshold)
-            if current_high >= liq_price: is_liquidated = True
-                
-        if is_liquidated:
-            logger.warning(f"!!! [LIQUIDATION] Price hit {liq_price:.2f} (Lev: x{lev})")
-            loss = (entry * size) / lev 
-            self.balance -= loss 
-            self.position = None
-            return -loss
+        # Fallback (5분봉 없을 때)
+        if not exit_triggered:
+            sl_dist = current_atr * sl_mult
+            
+            # Fallback은 보수적으로 고정 SL만 체크 (TP는 정밀 데이터에서만)
+            if p_type == 'LONG':
+                sl_price = entry - sl_dist
+                if current_low <= sl_price:
+                    exit_triggered = True; exit_price = sl_price; exit_reason = "StopLoss(Bar)"
+            else:
+                sl_price = entry + sl_dist
+                if current_high >= sl_price:
+                    exit_triggered = True; exit_price = sl_price; exit_reason = "StopLoss(Bar)"
 
-        # 청산 로직
-        close_signal = False
-        reason = ""
-        exec_price = current_close
-
-        if p_type == 'LONG':
-            self.peak_price = max(self.peak_price, current_high)
-            if current_low <= sl_price:
-                close_signal = True; reason = "AI_StopLoss"; exec_price = sl_price
-            elif current_high >= tp_price:
-                # Trailing Profit: 익절 구간 도달 후 20% 반납 시 청산
-                trailing_gap = (tp_price - entry) * 0.2 
-                if current_close <= (self.peak_price - trailing_gap):
-                    close_signal = True; reason = "AI_TrailingProfit"
+        if exit_triggered:
+            if exit_reason == "LIQUIDATION":
+                logger.warning(f"!!! [LIQUIDATION] Price hit {exit_price:.2f}")
+                loss = (entry * size)
+                self.balance -= loss
+                self.position = None
+                return -loss
+            else:
+                self._force_close(exit_price, exit_time, exit_reason)
+                return 0
         
-        elif p_type == 'SHORT':
-            self.peak_price = min(self.peak_price, current_low)
-            if current_high >= sl_price:
-                close_signal = True; reason = "AI_StopLoss"; exec_price = sl_price
-            elif current_low <= tp_price:
-                trailing_gap = (entry - tp_price) * 0.2
-                if current_close >= (self.peak_price + trailing_gap):
-                    close_signal = True; reason = "AI_TrailingProfit"
-
-        if close_signal:
-            self._force_close(exec_price, timestamp, reason)
-            return 0
-
-        # 평가손익 반환
         if p_type == 'LONG': return (current_close - entry) * size
         else: return (entry - current_close) * size
 
@@ -120,47 +165,51 @@ class AccountManager:
 
         size = self.position['size']
         entry = self.position['price']
+        leverage = self.position['leverage']
         
         if self.position['type'] == 'LONG': pnl = (real_price - entry) * size
         else: pnl = (entry - real_price) * size
             
-        pnl -= (real_price * size * config.COMMISSION)
+        fee = real_price * size * config.COMMISSION
+        pnl -= fee
+        
         self.balance += pnl
         
-        logger.info(f"[{timestamp}] Close {self.position['type']} ({reason}) | Price: {real_price:.2f} | PnL: {pnl:+.2f} | Bal: {self.balance:.0f}")
+        # ROI 계산
+        margin = (entry * size) / leverage
+        roi = (pnl / margin) * 100 if margin > 0 else 0.0
+
+        logger.info(f"[{timestamp}] Close {self.position['type']} ({reason}) | "
+                    f"Price: {real_price:.2f} | PnL: {pnl:+.2f} ({roi:+.2f}%) | Bal: {self.balance:.0f}")
+        
         self.position = None
         self.peak_price = 0
 
-    def execute_trade(self, signal, price, qty, leverage, sl_dist, tp_dist, timestamp):
+    def execute_trade(self, signal, price, qty, leverage, timestamp):
         if self.position:
-             if (self.position['type'] == 'LONG' and signal == 'OPEN_SHORT') or \
-               (self.position['type'] == 'SHORT' and signal == 'OPEN_LONG'):
-                self._force_close(price, timestamp, 'SignalSwitch')
+            should_close = False
+            if self.position['type'] == 'LONG' and signal == 'OPEN_SHORT': should_close = True
+            if self.position['type'] == 'SHORT' and signal == 'OPEN_LONG': should_close = True
+            if should_close: self._force_close(price, timestamp, 'SignalSwitch')
 
         if signal in ['OPEN_LONG', 'OPEN_SHORT'] and not self.position:
-            if self.balance <= 0 or qty <= 0: return 
-
+            if self.balance <= 0: return 
+            
             if signal == 'OPEN_LONG':
-                real_entry = price * (1 + config.SLIPPAGE)
+                real_entry_price = price * (1 + config.SLIPPAGE)
                 p_type = 'LONG'
-                sl_price = real_entry - sl_dist
-                tp_price = real_entry + tp_dist
             else:
-                real_entry = price * (1 - config.SLIPPAGE)
+                real_entry_price = price * (1 - config.SLIPPAGE)
                 p_type = 'SHORT'
-                sl_price = real_entry + sl_dist
-                tp_price = real_entry - tp_dist
             
-            self.balance -= (real_entry * qty * config.COMMISSION)
+            if qty <= 0: return
             
-            self.position = {
-                'type': p_type, 
-                'price': real_entry, 
-                'size': qty, 
-                'leverage': leverage,
-                'sl_price': sl_price,
-                'tp_price': tp_price
-            }
-            self.peak_price = real_entry
-            logger.info(f"[{timestamp}] Open {p_type} @ {real_entry:.2f} (Qty: {qty:.4f}, Lev: x{leverage})")
-            logger.info(f"    >> Params: SL {sl_price:.2f} / TP {tp_price:.2f}")
+            leverage = int(leverage)
+            initial_margin = (real_entry_price * qty) / leverage
+            if initial_margin > self.balance:
+                qty = (self.balance * leverage) / real_entry_price
+
+            self.balance -= (real_entry_price * qty * config.COMMISSION)
+            self.position = {'type': p_type, 'price': real_entry_price, 'size': qty, 'leverage': leverage}
+            self.peak_price = real_entry_price
+            logger.info(f"[{timestamp}] Open {p_type} @ {real_entry_price:.2f} (Qty: {qty:.4f}, Lev: x{leverage})")

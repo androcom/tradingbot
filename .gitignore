@@ -192,3 +192,4 @@ pip-selfcheck.json
 *.png
 *.h5
 *.pkl
+*.parquet

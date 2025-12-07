@@ -1,5 +1,7 @@
 pandas
 numpy<2.0
+numba
+pyarrow
 matplotlib
 ccxt
 ta

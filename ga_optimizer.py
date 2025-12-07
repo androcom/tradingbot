@@ -1,195 +1,213 @@
 # ga_optimizer.py
-import random
 import numpy as np
-import copy
-import logging
+import random
 import config
+from numba import njit
+from joblib import Parallel, delayed
 
-logger = logging.getLogger("BacktestLogger")
+# ---------------------------------------------------------
+# [핵심] Numba JIT 컴파일된 백테스트 코어 (MDD 계산 추가)
+# ---------------------------------------------------------
+@njit(fastmath=True, nogil=True)
+def fast_backtest_core(
+    opens, highs, lows, closes, atrs, scores,
+    balance,
+    entry_threshold, sl_mul, risk_scale, tp_ratio,
+    min_lev, max_lev,
+    fee_rate, enable_short
+):
+    # 상태 변수
+    position_type = 0 # 0: None, 1: Long, -1: Short
+    entry_price = 0.0
+    position_size = 0.0
+    sl_price = 0.0
+    tp_price = 0.0
+    
+    init_balance = balance
+    peak_balance = balance
+    max_drawdown = 0.0
+    trade_count = 0
+    win_count = 0
+    
+    n = len(closes)
+    
+    for i in range(n - 1):
+        if balance <= 0: break
+        
+        # MDD 갱신 (매 봉마다)
+        if balance > peak_balance: peak_balance = balance
+        dd = (peak_balance - balance) / peak_balance
+        if dd > max_drawdown: max_drawdown = dd
+        
+        score = scores[i]
+        confidence = abs(score)
+        
+        next_o = opens[i+1]
+        next_h = highs[i+1]
+        next_l = lows[i+1]
+        current_atr = atrs[i]
+        
+        # --- 청산 로직 ---
+        if position_type != 0:
+            closed = False
+            exit_price = 0.0
+            pnl = 0.0
+            
+            # Long 청산 체크
+            if position_type == 1:
+                if next_l <= sl_price:
+                    exit_price = sl_price; closed = True
+                elif next_h >= tp_price:
+                    exit_price = tp_price; closed = True
+            # Short 청산 체크
+            else:
+                if next_h >= sl_price:
+                    exit_price = sl_price; closed = True
+                elif next_l <= tp_price:
+                    exit_price = tp_price; closed = True
+            
+            if closed:
+                if position_type == 1: pnl = (exit_price - entry_price) * position_size
+                else: pnl = (entry_price - exit_price) * position_size
+                
+                # 수수료 차감
+                cost = exit_price * position_size * fee_rate
+                balance += (pnl - cost)
+                
+                if pnl > 0: win_count += 1
+                trade_count += 1
+                position_type = 0
+                
+                # 청산 후 MDD 다시 체크
+                if balance > peak_balance: peak_balance = balance
+                dd = (peak_balance - balance) / peak_balance
+                if dd > max_drawdown: max_drawdown = dd
+
+        # --- 진입 로직 ---
+        # 포지션이 없고, AI 신호가 강할 때
+        if position_type == 0 and confidence > entry_threshold:
+            signal = 1 if score > 0 else -1
+            if signal == -1 and not enable_short: continue
+                
+            risk_amt = balance * risk_scale
+            sl_dist = current_atr * sl_mul
+            
+            if sl_dist > 0:
+                qty_risk = risk_amt / sl_dist
+                
+                # 레버리지 계산
+                ratio = (confidence - entry_threshold) / (1.0 - entry_threshold + 1e-9)
+                ratio = min(max(ratio, 0.0), 1.0)
+                target_lev = min_lev + (ratio * (max_lev - min_lev))
+                
+                max_qty = (balance * target_lev) / next_o
+                qty = min(qty_risk, max_qty)
+                
+                if qty > 0:
+                    real_entry = next_o * (1 + fee_rate) if signal == 1 else next_o * (1 - fee_rate)
+                    entry_cost = real_entry * qty * fee_rate
+                    
+                    if balance > entry_cost:
+                        balance -= entry_cost
+                        position_type = signal
+                        entry_price = real_entry
+                        position_size = qty
+                        
+                        if signal == 1:
+                            sl_price = real_entry - sl_dist
+                            tp_price = real_entry + (sl_dist * tp_ratio)
+                        else:
+                            sl_price = real_entry + sl_dist
+                            tp_price = real_entry - (sl_dist * tp_ratio)
+
+    return balance, trade_count, max_drawdown, win_count
 
 class GeneticOptimizer:
     def __init__(self):
-        self.bounds = config.GENE_RANGES
+        self.settings = config.GA_SETTINGS
+        self.gene_ranges = config.GA_GENE_RANGES
 
     def create_individual(self):
-        """랜덤한 유전자(파라미터 세트) 생성"""
-        return {
-            'base_threshold': random.uniform(*self.bounds['base_threshold']),
-            'vol_impact': random.uniform(*self.bounds['vol_impact']),
-            'sl_mul': random.uniform(*self.bounds['sl_mul']),
-            'tp_ratio': random.uniform(*self.bounds['tp_ratio'])
-        }
-
-    def crossover(self, parent1, parent2):
-        """두 부모 유전자를 섞어 자식 생성 (Uniform Crossover)"""
-        child = {}
-        for key in parent1:
-            if random.random() > 0.5:
-                child[key] = parent1[key]
-            else:
-                child[key] = parent2[key]
-        return child
+        return {k: random.uniform(v[0], v[1]) for k, v in self.gene_ranges.items()}
 
     def mutate(self, individual):
-        """돌연변이: 일정 확률로 유전자 값을 랜덤 변경"""
-        for key in individual:
-            if random.random() < config.GA_MUTATION_RATE:
-                individual[key] = random.uniform(*self.bounds[key])
+        for k in individual:
+            if random.random() < self.settings['mutation_rate']:
+                low, high = self.gene_ranges[k]
+                individual[k] = random.uniform(low, high)
         return individual
 
-    def fast_backtest(self, ohlcv_data, predictions, genes):
-        """
-        초고속 백테스트 (GA용)
-        - 복잡한 로깅이나 객체 생성 없이 수치 계산만 수행
-        - ohlcv_data: [(open, high, low, close), ...] numpy array
-        - predictions: [(score, pred_vol), ...] numpy array
-        """
-        balance = config.INITIAL_BALANCE
-        position = None # (type, entry_price, size, leverage, sl, tp)
+    def crossover(self, p1, p2):
+        child = {}
+        for k in p1:
+            child[k] = p1[k] if random.random() > 0.5 else p2[k]
+        return child
+
+    def optimize(self, df, scores):
+        # 데이터 준비
+        opens = df['open'].values.astype(np.float64)
+        highs = df['high'].values.astype(np.float64)
+        lows = df['low'].values.astype(np.float64)
+        closes = df['close'].values.astype(np.float64)
         
-        # 데이터 언패킹 (속도 최적화)
-        opens = ohlcv_data[:, 0]
-        highs = ohlcv_data[:, 1]
-        lows = ohlcv_data[:, 2]
-        closes = ohlcv_data[:, 3]
-        
-        scores = predictions[:, 0]
-        pred_vols = predictions[:, 1]
-        
-        n = len(closes)
-        
-        for i in range(n - 1):
-            if balance <= 0: break
+        # 원본 ATR 사용 (DataProcessor 수정 필요 없이 여기서 처리 가능하면 좋음)
+        if 'atr_origin' in df: atrs = df['atr_origin'].values.astype(np.float64)
+        else: atrs = df['atr'].values.astype(np.float64)
             
-            # 1. 포지션 관리 (청산)
-            if position is not None:
-                p_type, entry, size, lev, sl, tp = position
-                
-                # 강제청산 체크
-                liq_rate = 1.0 / lev
-                liq_price = entry * (1 - liq_rate) if p_type == 1 else entry * (1 + liq_rate)
-                
-                is_liq = False
-                if p_type == 1: # LONG
-                    if lows[i+1] <= liq_price: is_liq = True
-                else: # SHORT
-                    if highs[i+1] >= liq_price: is_liq = True
-                
-                if is_liq:
-                    loss = (entry * size) / lev
-                    balance -= loss
-                    position = None
-                    continue
+        scores = scores.astype(np.float64)
+        
+        fee_rate = config.COMMISSION + config.SLIPPAGE
+        min_lev = float(config.MIN_LEVERAGE)
+        max_lev = float(config.MAX_LEVERAGE)
+        enable_short = config.ENABLE_SHORT
+        init_bal = float(config.INITIAL_BALANCE)
 
-                # SL/TP 체크
-                close_signal = False
-                exec_price = closes[i+1]
-                
-                if p_type == 1: # LONG
-                    if lows[i+1] <= sl:
-                        close_signal = True; exec_price = sl
-                    elif highs[i+1] >= tp:
-                        close_signal = True; exec_price = tp
-                else: # SHORT
-                    if highs[i+1] >= sl:
-                        close_signal = True; exec_price = sl
-                    elif lows[i+1] <= tp:
-                        close_signal = True; exec_price = tp
-                
-                if close_signal:
-                    # 수수료/슬리피지 단순화 적용
-                    if p_type == 1: pnl = (exec_price - entry) * size
-                    else: pnl = (entry - exec_price) * size
-                    balance += pnl
-                    balance -= (exec_price * size * config.COMMISSION)
-                    position = None
-                    
-            # 2. 신규 진입 (포지션 없을 때만)
-            if position is None:
-                score = scores[i]
-                vol = pred_vols[i]
-                curr_price = opens[i+1] # 다음 봉 시가 진입
-                
-                # [동적 파라미터 적용]
-                threshold = genes['base_threshold'] + (vol * genes['vol_impact'])
-                threshold = min(threshold, 0.9)
-                
-                confidence = abs(score)
-                if confidence < threshold: continue
-                
-                # 신호 결정
-                signal = 0 # 0: None, 1: Long, -1: Short
-                if score > 0: signal = 1
-                elif score < 0 and config.ENABLE_SHORT: signal = -1
-                
-                if signal == 0: continue
-                
-                # 레버리지 및 수량 계산
-                raw_lev = 1 + (confidence * (config.MAX_LEVERAGE - 1)) / 0.8
-                lev = int(np.clip(round(raw_lev), config.MIN_LEVERAGE, config.MAX_LEVERAGE))
-                
-                sl_dist = curr_price * (max(vol, 0.005) * genes['sl_mul'])
-                tp_dist = sl_dist * genes['tp_ratio']
-                
-                risk_amt = balance * config.MAX_RISK_PER_TRADE_CAP
-                qty = risk_amt / sl_dist if sl_dist > 0 else 0
-                max_qty = (balance * lev) / curr_price
-                qty = min(qty, max_qty)
-                
-                if qty <= 0: continue
-                
-                # 포지션 생성
-                if signal == 1:
-                    sl_price = curr_price - sl_dist
-                    tp_price = curr_price + tp_dist
-                else:
-                    sl_price = curr_price + sl_dist
-                    tp_price = curr_price - tp_dist
-                
-                balance -= (curr_price * qty * config.COMMISSION)
-                position = (signal, curr_price, qty, lev, sl_price, tp_price)
-
-        return balance
-
-    def optimize(self, ohlcv_data, predictions):
-        """유전 알고리즘 메인 루프"""
-        # 초기 개체군 생성
-        population = [self.create_individual() for _ in range(config.GA_POPULATION_SIZE)]
-        best_gene = None
-        best_fitness = -float('inf')
-
-        for gen in range(config.GA_GENERATIONS):
-            # 적합도 평가 (병렬 처리 가능하나 여기선 단순 루프)
+        pop_size = self.settings['population_size']
+        population = [self.create_individual() for _ in range(pop_size)]
+        
+        for gen in range(self.settings['generations']):
+            results = Parallel(n_jobs=-1)(
+                delayed(fast_backtest_core)(
+                    opens, highs, lows, closes, atrs, scores,
+                    init_bal,
+                    ind['entry_threshold'], ind['sl_mul'], ind['risk_scale'], ind['tp_ratio'],
+                    min_lev, max_lev, fee_rate, enable_short
+                ) for ind in population
+            )
+            
             fitness_scores = []
-            for ind in population:
-                final_bal = self.fast_backtest(ohlcv_data, predictions, ind)
-                # 수익률이 0 이하거나 파산하면 페널티
-                fitness = final_bal if final_bal > 0 else -999999
+            for (bal, cnt, mdd, wins), ind in zip(results, population):
+                # [수정] Fitness Function: Risk-Adjusted Return
+                # 수익률이 높아도 MDD가 크면 점수 대폭 삭감
+                roi = (bal - init_bal) / init_bal
+                
+                # 페널티 조건
+                if cnt < 3: # 거래가 너무 적으면 무효
+                    fitness = -1.0
+                elif bal < init_bal * 0.8: # 원금 20% 이상 손실시 탈락
+                    fitness = -10.0
+                else:
+                    # Calmar Ratio 유사 지표: ROI / (MDD + 0.1)
+                    # MDD가 0일 경우를 대비해 0.05~0.1 정도 더해줌
+                    fitness = roi / (mdd + 0.05)
+                
                 fitness_scores.append((fitness, ind))
             
             # 정렬 (내림차순)
             fitness_scores.sort(key=lambda x: x[0], reverse=True)
             
-            # 최고 기록 갱신
-            if fitness_scores[0][0] > best_fitness:
-                best_fitness = fitness_scores[0][0]
-                best_gene = copy.deepcopy(fitness_scores[0][1])
-            
             # 엘리트 선택
-            next_generation = [x[1] for x in fitness_scores[:config.GA_ELITISM]]
+            next_gen = [x[1] for x in fitness_scores[:self.settings['elitism']]]
             
-            # 나머지 채우기 (토너먼트 선택 + 교배 + 변이)
-            while len(next_generation) < config.GA_POPULATION_SIZE:
-                # 토너먼트 선택
-                candidates = random.sample(fitness_scores, 5)
-                parent1 = max(candidates, key=lambda x: x[0])[1]
-                candidates = random.sample(fitness_scores, 5)
-                parent2 = max(candidates, key=lambda x: x[0])[1]
-                
-                child = self.crossover(parent1, parent2)
+            # 다음 세대 생성
+            while len(next_gen) < pop_size:
+                p1 = random.choice(fitness_scores[:int(pop_size/2)])[1]
+                p2 = random.choice(fitness_scores[:int(pop_size/2)])[1]
+                child = self.crossover(p1, p2)
                 child = self.mutate(child)
-                next_generation.append(child)
+                next_gen.append(child)
+                
+            population = next_gen
             
-            population = next_generation
-
-        return best_gene, best_fitness
+        # 최적해 반환
+        return fitness_scores[0][1]

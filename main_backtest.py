@@ -4,21 +4,20 @@ import numpy as np
 from datetime import timedelta
 import logging
 import os
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt 
 import config
 from data_processor import DataProcessor
 from ai_models import HybridEnsemble
 from trading_engine import AccountManager
-from ga_optimizer import GeneticOptimizer
 from sklearn.preprocessing import RobustScaler
+from ga_optimizer import GeneticOptimizer
 
-# 로거 설정 (기존과 동일)
 logger = logging.getLogger("BacktestLogger")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 logger.propagate = False 
 if not os.path.exists(config.LOG_DIR): os.makedirs(config.LOG_DIR)
 file_handler = logging.FileHandler(config.LOG_FILE, mode='w', encoding='utf-8')
-file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+file_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
 logger.addHandler(file_handler)
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter('%(message)s'))
@@ -27,21 +26,33 @@ logger.addHandler(console_handler)
 def plot_results(df_result, symbol):
     if df_result.empty: return
     safe_symbol = symbol.replace('/', '_')
-    chart_path = os.path.join(config.LOG_DIR, f"equity_{safe_symbol}.png")
+    chart_path = os.path.join(config.LOG_DIR, f"equity_curve_{safe_symbol}.png")
     
     df_result.index = pd.to_datetime(df_result.index)
-    plt.figure(figsize=(12, 6))
-    plt.plot(df_result.index, df_result['balance'], label=f'{symbol} Balance')
+    running_max = df_result['balance'].cummax()
+    drawdown = (df_result['balance'] - running_max) / running_max * 100
+    
+    plt.figure(figsize=(12, 8))
+    plt.subplot(2, 1, 1)
+    plt.plot(df_result.index, df_result['balance'], label=f'{symbol} Balance', color='blue')
     plt.title(f'Equity Curve - {symbol}')
     plt.grid(True)
     plt.legend()
+    
+    plt.subplot(2, 1, 2)
+    plt.fill_between(df_result.index, drawdown, 0, color='red', alpha=0.3)
+    plt.plot(df_result.index, drawdown, color='red', label='Drawdown (%)')
+    plt.title('Drawdown')
+    plt.grid(True)
+    plt.legend()
+    
+    plt.tight_layout()
     plt.savefig(chart_path)
+    logger.info(f"   [Result] Chart saved to {chart_path}")
     plt.close()
 
 def run_strategy(symbol):
-    logger.info("\n" + "="*60)
-    logger.info(f">> STARTING STRATEGY FOR: {symbol}")
-    logger.info("="*60)
+    logger.info(f"\n{'='*60}\n>> STARTING PHASE-1 FINAL STRATEGY: {symbol}\n{'='*60}")
 
     dp = DataProcessor(symbol)
     full_df = dp.prepare_multi_timeframe_data()
@@ -50,171 +61,175 @@ def run_strategy(symbol):
         logger.error("!! Not enough data.")
         return
 
-    exclude_cols = ['timestamp', 'target_cls', 'target_vol', 'open', 'high', 'low', 'close', 'volume']
-    feature_cols = [c for c in full_df.columns if c not in exclude_cols]
+    exclude_cols = ['timestamp', 'target_cls', 'open', 'high', 'low', 'close', 'volume', 'atr_origin', 'ema_200_origin', 'rsi_origin', 'rvol_origin']
+    features = [c for c in full_df.columns if c not in exclude_cols]
     
-    current_train_end = pd.to_datetime(config.TEST_START)
+    df_5m = dp.load_precision_data(config.TEST_START)
+
+    current_test_start = pd.to_datetime(config.TEST_START)
     final_end = pd.to_datetime(config.COLLECT_END)
-    interval = timedelta(days=config.ONLINE_TRAIN_INTERVAL_DAYS)
+    train_interval = timedelta(days=config.ONLINE_TRAIN_INTERVAL_DAYS)
     
     model = HybridEnsemble(symbol)
-    account = AccountManager(balance=config.INITIAL_BALANCE)
-    ga = GeneticOptimizer() # GA 옵티마이저 생성
+    optimizer = GeneticOptimizer()
     
-    equity_curve = [{'time': current_train_end, 'balance': config.INITIAL_BALANCE}]
+    account = AccountManager(balance=config.INITIAL_BALANCE, leverage=1)
+    equity_curve = [{'time': current_test_start, 'balance': config.INITIAL_BALANCE}]
     
-    # 초기 유전자는 기본값으로 시작
-    current_genes = {
-        'base_threshold': 0.2, 'vol_impact': 1.0, 'sl_mul': 1.0, 'tp_ratio': 2.0
+    current_params = {
+        'entry_threshold': 0.45, 'sl_mul': 3.0, 'risk_scale': 0.02, 'tp_ratio': 2.0
     }
 
-    while current_train_end < final_end:
-        chunk_end = current_train_end + interval
-        if chunk_end > final_end: chunk_end = final_end
+    while current_test_start < final_end:
+        current_test_end = current_test_start + train_interval
+        if current_test_end > final_end: current_test_end = final_end
         
-        logger.info(f"\n>> [Period] {current_train_end} ~ {chunk_end} | Symbol: {symbol}")
-        
-        # 1. 데이터 분리
-        train_mask = full_df.index < current_train_end
-        test_mask = (full_df.index >= current_train_end) & (full_df.index < chunk_end)
-        
-        train_df = full_df.loc[train_mask]
-        test_df = full_df.loc[test_mask]
-        
-        if test_df.empty: break
-        if len(train_df) < config.LSTM_WINDOW + 200:
-            current_train_end = chunk_end; continue
+        logger.info(f"\n>> [Period] {current_test_start} ~ {current_test_end}")
 
-        # 2. 스케일링
+        # A. 데이터 분할
+        train_start_lookback = current_test_start - timedelta(days=365) 
+        train_mask = (full_df.index >= train_start_lookback) & (full_df.index < current_test_start)
+        test_mask = (full_df.index >= current_test_start) & (full_df.index < current_test_end)
+        
+        df_train_raw = full_df.loc[train_mask].copy()
+        df_test_raw = full_df.loc[test_mask].copy()
+        
+        if len(df_train_raw) < config.LSTM_WINDOW * 2 or df_test_raw.empty:
+            current_test_start = current_test_end
+            continue
+
+        # B. 스케일링
         scaler = RobustScaler()
-        X_train_raw = train_df[feature_cols].values
-        X_test_raw = test_df[feature_cols].values
-        
-        X_train_scaled = scaler.fit_transform(X_train_raw)
-        X_test_scaled = scaler.transform(X_test_raw)
-        
-        y_train_cls = train_df['target_cls'].values
-        y_train_vol = train_df['target_vol'].values
+        df_train_scaled = df_train_raw.copy()
+        df_train_scaled[features] = scaler.fit_transform(df_train_raw[features])
+        df_test_scaled = df_test_raw.copy()
+        df_test_scaled[features] = scaler.transform(df_test_raw[features])
+        df_train_scaled.fillna(0, inplace=True)
+        df_test_scaled.fillna(0, inplace=True)
 
-        # 3. 모델 학습 (LSTM/XGB)
-        # 시퀀스 생성
-        X_train_seq, y_train_seq_cls, y_train_seq_vol = dp.create_sequences(
-            X_train_scaled, y_train_cls, y_train_vol, config.LSTM_WINDOW
+        # C. AI 모델 학습 & 저장
+        X_train_seq, y_train_seq = dp.create_sequences(df_train_scaled, features, config.LSTM_WINDOW)
+        X_train_flat = df_train_scaled.iloc[config.LSTM_WINDOW:][features].values
+        y_train_flat = df_train_scaled.iloc[config.LSTM_WINDOW:]['target_cls'].values
+        
+        logger.info("   [AI] Training Model...")
+        model.train(X_train_seq, y_train_seq, X_train_flat, y_train_flat)
+        model.save_models()
+        
+        # D. GA 파라미터 최적화
+        train_ai_scores = model.batch_predict(X_train_seq, X_train_flat)
+        logger.info("   [GA] Optimizing Parameters...")
+        best_params = optimizer.optimize(
+            df_train_raw.iloc[config.LSTM_WINDOW:], 
+            train_ai_scores
         )
-        
-        # XGB용 평탄화 데이터 (LSTM 윈도우 이후부터 사용 가능)
-        X_train_flat = X_train_scaled[config.LSTM_WINDOW:]
-        y_train_flat_cls = y_train_cls[config.LSTM_WINDOW:]
-        
-        model.train(
-            X_train_seq, y_train_seq_cls, y_train_seq_vol, 
-            X_train_flat, y_train_flat_cls, 
-            features_name=feature_cols, is_update=(account.position is not None)
+        current_params = best_params
+        logger.info(f"   [GA] Best: Th={best_params['entry_threshold']:.2f}, SL={best_params['sl_mul']:.1f}, Risk={best_params['risk_scale']:.3f}")
+
+        # E. 백테스트 실행
+        X_test_seq, _ = dp.create_sequences(
+            pd.concat([df_train_scaled.iloc[-config.LSTM_WINDOW:], df_test_scaled]), 
+            features, 
+            config.LSTM_WINDOW
         )
-
-        # -------------------------------------------------------------
-        # [NEW] GA 최적화 단계 (최근 학습 데이터의 일부를 사용하여 최적화)
-        # -------------------------------------------------------------
-        logger.info("   >> Running GA Optimization on recent data...")
+        X_test_flat = df_test_scaled[features].values
+        test_ai_scores = model.batch_predict(X_test_seq, X_test_flat)
         
-        # GA용 Calibration 데이터 (Train의 마지막 3개월 정도 사용)
-        calib_size = 90 * 6 # 90일 * 4시간봉(6개/일) = 540개
-        if len(X_train_scaled) > calib_size + config.LSTM_WINDOW:
-            X_calib = X_train_scaled[-calib_size:]
-            # Calibration용 OHLCV (가격 데이터 필요)
-            calib_ohlcv = train_df[['open', 'high', 'low', 'close']].values[-calib_size:]
-            
-            # Calibration 데이터에 대해 AI 예측 수행
-            # (학습된 모델이 과거 데이터를 보고 어떤 점수를 줬을지 계산)
-            dummy_y = np.zeros(len(X_calib))
-            X_calib_seq, _, _ = dp.create_sequences(X_calib, dummy_y, dummy_y, config.LSTM_WINDOW)
-            
-            # 시퀀스 생성으로 인해 앞부분 잘림 보정
-            calib_ohlcv_cut = calib_ohlcv[config.LSTM_WINDOW:] 
-            X_calib_flat = X_calib[config.LSTM_WINDOW:]
-            
-            # 예측 (Score, Vol)
-            calib_scores, calib_vols = model.predict(X_calib_seq, X_calib_flat)
-            
-            # GA 입력용 통합 배열 생성
-            ga_input_preds = np.column_stack((calib_scores, calib_vols))
-            
-            # GA 실행
-            best_gene, best_fit = ga.optimize(calib_ohlcv_cut, ga_input_preds)
-            current_genes = best_gene
-            logger.info(f"   >> [GA Best Gene] Fit: {best_fit:.1f} | Genes: {current_genes}")
-        else:
-            logger.warning("   >> Not enough data for GA. Using previous genes.")
-
-        # -------------------------------------------------------------
-        # 4. 실전(Test) 매매 시뮬레이션
-        # -------------------------------------------------------------
-        combined_scaled = np.concatenate([X_train_scaled[-config.LSTM_WINDOW:], X_test_scaled], axis=0)
-        dummy_y = np.zeros(len(combined_scaled))
-        X_test_seq, _, _ = dp.create_sequences(combined_scaled, dummy_y, dummy_y, config.LSTM_WINDOW)
-        X_test_flat = X_test_scaled
-
-        # Test 구간 예측
-        ai_scores, pred_vols = model.predict(X_test_seq, X_test_flat)
-
-        for i in range(len(test_df) - 1):
+        for i in range(len(df_test_raw)):
             if account.balance <= 0: break
             
-            curr_row = test_df.iloc[i]
-            next_bar = test_df.iloc[i+1]
-            timestamp = next_bar.name
+            bar_idx = i
+            if bar_idx >= len(test_ai_scores): break
             
-            score = ai_scores[i]
-            pred_vol = pred_vols[i]
+            curr_row = df_test_raw.iloc[bar_idx]
+            if bar_idx == len(df_test_raw) - 1: continue 
+            next_bar = df_test_raw.iloc[bar_idx + 1]
+            
+            score = test_ai_scores[bar_idx]
+            
+            # 지표 추출
+            current_atr = curr_row.get('atr_origin', curr_row['atr'])
+            current_price = curr_row['close']
+            current_ema = curr_row.get('ema_200_origin', curr_row['ema_200'])
+            current_bb_w = curr_row['bb_width']
+            current_adx = curr_row['adx'] 
+            current_rsi = curr_row.get('rsi_origin', curr_row['rsi'])
+            current_rvol = curr_row.get('rvol_origin', curr_row['rvol'])
+
+            signal = 'HOLD'
+            
+            # -----------------------------------------------------------
+            # [최종 전략] Regime Switching + Volume Filter
+            # -----------------------------------------------------------
+            
+            # 1. 거래량 필터 (가짜 파동 방지)
+            is_volume_supported = current_rvol > config.RVOL_THRESHOLD
+
+            if current_bb_w > config.BB_WIDTH_THRESHOLD and is_volume_supported:
+                
+                is_trend_mode = current_adx > config.ADX_THRESHOLD 
+                is_uptrend = current_price > current_ema
+                
+                # [CASE 1] 추세장 (Trend Following)
+                if is_trend_mode:
+                    if is_uptrend:
+                        if score > current_params['entry_threshold']: signal = 'OPEN_LONG'
+                    else: 
+                        if config.ENABLE_SHORT and score < -current_params['entry_threshold']: signal = 'OPEN_SHORT'
+                
+                # [CASE 2] 횡보장 (Mean Reversion)
+                else:
+                    is_oversold = current_rsi < 30
+                    is_overbought = current_rsi > 70
+                    
+                    if is_oversold and score > current_params['entry_threshold']: signal = 'OPEN_LONG'
+                    elif config.ENABLE_SHORT and is_overbought and score < -current_params['entry_threshold']: signal = 'OPEN_SHORT'
+
+            # 실행
             exec_price = next_bar['open']
+            dyn_lev = 1
+            qty = 0
             
-            # SL/TP 청산 체크
-            sl = account.position['sl_price'] if account.position else 0
-            tp = account.position['tp_price'] if account.position else 0
+            if signal != 'HOLD':
+                dyn_lev = account.get_dynamic_leverage(score, current_params['entry_threshold'])
+                qty = account.get_position_qty(
+                    exec_price, score, current_atr, dyn_lev,
+                    risk_scale=current_params['risk_scale'],
+                    sl_mult=current_params['sl_mul']
+                )
             
+            account.execute_trade(signal, exec_price, qty, dyn_lev, next_bar.name)
+            
+            # 청산 로직 (Trailing Stop 포함)
+            bar_start = next_bar.name
+            bar_end = bar_start + timedelta(hours=1)
+            try: precision_candles = df_5m.loc[bar_start:bar_end]
+            except: precision_candles = pd.DataFrame()
+
             account.update_pnl_and_check_exit(
-                next_bar['close'], next_bar['high'], next_bar['low'], 
-                timestamp, sl, tp
+                next_bar['close'], next_bar['high'], next_bar['low'], next_bar.name,
+                current_atr, precision_candles,
+                sl_mult=current_params['sl_mul'],
+                tp_ratio=current_params['tp_ratio']
             )
             
-            # 신규 진입 (GA가 찾아낸 current_genes 사용)
-            if not account.position:
-                lev, qty, sl_dist, tp_dist = account.calculate_trade_parameters(
-                    score, pred_vol, exec_price, current_genes
-                )
-                
-                # 진입 결정 (calculate_trade_parameters가 0을 리턴하면 진입 안 함)
-                if qty > 0:
-                    signal = 'OPEN_LONG' if score > 0 else 'OPEN_SHORT'
-                    if score < 0 and not config.ENABLE_SHORT: signal = 'HOLD'
-                    
-                    if signal != 'HOLD':
-                        account.execute_trade(signal, exec_price, qty, lev, sl_dist, tp_dist, timestamp)
-                
-            equity_curve.append({'time': timestamp, 'balance': account.balance})
+            equity_curve.append({'time': next_bar.name, 'balance': account.balance})
 
-        current_train_end = chunk_end
-        if account.balance <= 0: 
-            logger.error("!!! BANKRUPT !!!")
+        current_test_start = current_test_end
+        if account.balance < config.INITIAL_BALANCE * 0.2:
+            logger.warning(">> BANKRUPTCY STOP.")
             break
-
-    # 최종 정리
-    if account.position:
-        account._force_close(full_df.iloc[-1]['close'], full_df.index[-1], 'FinalClose')
-        equity_curve.append({'time': full_df.index[-1], 'balance': account.balance})
 
     df_result = pd.DataFrame(equity_curve).set_index('time')
     df_result = df_result[~df_result.index.duplicated(keep='last')]
+    df_result.to_csv(os.path.join(config.LOG_DIR, f"final_result_{symbol.replace('/','_')}.csv"))
     
-    final_bal = df_result.iloc[-1]['balance']
-    roi = ((final_bal/config.INITIAL_BALANCE)-1)*100
-    logger.info(f"\n   >> [RESULT] {symbol} Balance: ${final_bal:,.2f} ({roi:+.2f}%)")
-    
-    safe_symbol = symbol.replace('/', '_')
-    df_result.to_csv(os.path.join(config.LOG_DIR, f"result_{safe_symbol}.csv"))
     plot_results(df_result, symbol)
+    
+    final_bal = account.balance
+    total_ret = ((final_bal - config.INITIAL_BALANCE) / config.INITIAL_BALANCE) * 100
+    logger.info(f"Final Balance: {final_bal:.2f} ({total_ret:+.2f}%)")
 
 if __name__ == "__main__":
-    # data_processor.py와 ai_models.py는 기존 코드 그대로 사용 (import 문제 없음)
-    for target_symbol in config.TARGET_SYMBOLS:
-        run_strategy(target_symbol)
+    for s in config.TARGET_SYMBOLS:
+        run_strategy(s)
