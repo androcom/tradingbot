@@ -102,22 +102,18 @@ class DataProcessor:
         ema_val = ta.trend.EMAIndicator(close=df['close'], window=config.EMA_WINDOW).ema_indicator()
         df[f'ema_200{suffix}'] = ema_val
 
-        # [신규 피처] RVOL, 이격도, 로그 수익률 등 AI 학습용 고급 지표
+        # [수정] RVOL 및 고급 피처 추가
         df[f'vol_ma{suffix}'] = df['volume'].rolling(window=20).mean()
-        # 0으로 나누기 방지
         df[f'rvol{suffix}'] = df['volume'] / (df[f'vol_ma{suffix}'] + 1e-9)
-        
         df[f'disparity{suffix}'] = df['close'] / (df[f'ema_200{suffix}'] + 1e-9)
         df[f'log_ret{suffix}'] = np.log(df['close'] / df['close'].shift(1))
 
-        # 원본 보존 (필터링 및 계산용)
         if suffix == '':
             df['atr_origin'] = atr_val
             df['ema_200_origin'] = ema_val
             df['rsi_origin'] = df['rsi']
             df['rvol_origin'] = df['rvol']
 
-        # 기존 보조지표들
         macd = ta.trend.MACD(close=df['close'])
         df[f'macd{suffix}'] = macd.macd()
         df[f'macd_diff{suffix}'] = macd.macd_diff() 
@@ -171,8 +167,6 @@ class DataProcessor:
         
         merged_df.dropna(inplace=True)
         merged_df = self.create_target_labels(merged_df)
-        
-        # Raw DF 반환 (스케일링은 main_backtest에서)
         return merged_df
 
     def load_precision_data(self, start_date):

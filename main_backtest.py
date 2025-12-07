@@ -38,21 +38,19 @@ def plot_results(df_result, symbol):
     plt.title(f'Equity Curve - {symbol}')
     plt.grid(True)
     plt.legend()
-    
     plt.subplot(2, 1, 2)
     plt.fill_between(df_result.index, drawdown, 0, color='red', alpha=0.3)
     plt.plot(df_result.index, drawdown, color='red', label='Drawdown (%)')
     plt.title('Drawdown')
     plt.grid(True)
     plt.legend()
-    
     plt.tight_layout()
     plt.savefig(chart_path)
     logger.info(f"   [Result] Chart saved to {chart_path}")
     plt.close()
 
 def run_strategy(symbol):
-    logger.info(f"\n{'='*60}\n>> STARTING PHASE-1 FINAL STRATEGY: {symbol}\n{'='*60}")
+    logger.info(f"\n{'='*60}\n>> STARTING PHASE-1 STABLE STRATEGY: {symbol}\n{'='*60}")
 
     dp = DataProcessor(symbol)
     full_df = dp.prepare_multi_timeframe_data()
@@ -77,7 +75,7 @@ def run_strategy(symbol):
     equity_curve = [{'time': current_test_start, 'balance': config.INITIAL_BALANCE}]
     
     current_params = {
-        'entry_threshold': 0.45, 'sl_mul': 3.0, 'risk_scale': 0.02, 'tp_ratio': 2.0
+        'entry_threshold': 0.6, 'sl_mul': 3.0, 'risk_scale': 0.01, 'tp_ratio': 2.0
     }
 
     while current_test_start < final_end:
@@ -107,7 +105,7 @@ def run_strategy(symbol):
         df_train_scaled.fillna(0, inplace=True)
         df_test_scaled.fillna(0, inplace=True)
 
-        # C. AI 모델 학습 & 저장
+        # C. AI 모델 학습 및 저장
         X_train_seq, y_train_seq = dp.create_sequences(df_train_scaled, features, config.LSTM_WINDOW)
         X_train_flat = df_train_scaled.iloc[config.LSTM_WINDOW:][features].values
         y_train_flat = df_train_scaled.iloc[config.LSTM_WINDOW:]['target_cls'].values
@@ -116,7 +114,7 @@ def run_strategy(symbol):
         model.train(X_train_seq, y_train_seq, X_train_flat, y_train_flat)
         model.save_models()
         
-        # D. GA 파라미터 최적화
+        # D. GA 최적화
         train_ai_scores = model.batch_predict(X_train_seq, X_train_flat)
         logger.info("   [GA] Optimizing Parameters...")
         best_params = optimizer.optimize(
@@ -126,7 +124,7 @@ def run_strategy(symbol):
         current_params = best_params
         logger.info(f"   [GA] Best: Th={best_params['entry_threshold']:.2f}, SL={best_params['sl_mul']:.1f}, Risk={best_params['risk_scale']:.3f}")
 
-        # E. 백테스트 실행
+        # E. 백테스트
         X_test_seq, _ = dp.create_sequences(
             pd.concat([df_train_scaled.iloc[-config.LSTM_WINDOW:], df_test_scaled]), 
             features, 
@@ -147,7 +145,7 @@ def run_strategy(symbol):
             
             score = test_ai_scores[bar_idx]
             
-            # 지표 추출
+            # 지표
             current_atr = curr_row.get('atr_origin', curr_row['atr'])
             current_price = curr_row['close']
             current_ema = curr_row.get('ema_200_origin', curr_row['ema_200'])
@@ -158,34 +156,30 @@ def run_strategy(symbol):
 
             signal = 'HOLD'
             
-            # -----------------------------------------------------------
-            # [최종 전략] Regime Switching + Volume Filter
-            # -----------------------------------------------------------
-            
-            # 1. 거래량 필터 (가짜 파동 방지)
+            # [수정] 안정형 전략: Super Trend Guard + Strict Reversal
             is_volume_supported = current_rvol > config.RVOL_THRESHOLD
 
-            if current_bb_w > config.BB_WIDTH_THRESHOLD and is_volume_supported:
-                
-                is_trend_mode = current_adx > config.ADX_THRESHOLD 
+            if current_bb_w > config.BB_WIDTH_THRESHOLD:
+                is_trend_mode = current_adx > config.ADX_THRESHOLD # 30
+                is_super_trend = current_adx > 45 
                 is_uptrend = current_price > current_ema
                 
-                # [CASE 1] 추세장 (Trend Following)
+                # Trend Mode
                 if is_trend_mode:
-                    if is_uptrend:
-                        if score > current_params['entry_threshold']: signal = 'OPEN_LONG'
-                    else: 
-                        if config.ENABLE_SHORT and score < -current_params['entry_threshold']: signal = 'OPEN_SHORT'
+                    if is_volume_supported:
+                        if is_uptrend:
+                            if score > current_params['entry_threshold']: signal = 'OPEN_LONG'
+                        else: 
+                            if config.ENABLE_SHORT and score < -current_params['entry_threshold']: signal = 'OPEN_SHORT'
                 
-                # [CASE 2] 횡보장 (Mean Reversion)
-                else:
-                    is_oversold = current_rsi < 30
-                    is_overbought = current_rsi > 70
+                # Range Mode (Super Trend일 땐 역추세 금지)
+                elif not is_super_trend:
+                    is_oversold = current_rsi < 25 # 엄격
+                    is_overbought = current_rsi > 75
                     
                     if is_oversold and score > current_params['entry_threshold']: signal = 'OPEN_LONG'
                     elif config.ENABLE_SHORT and is_overbought and score < -current_params['entry_threshold']: signal = 'OPEN_SHORT'
 
-            # 실행
             exec_price = next_bar['open']
             dyn_lev = 1
             qty = 0
@@ -200,7 +194,6 @@ def run_strategy(symbol):
             
             account.execute_trade(signal, exec_price, qty, dyn_lev, next_bar.name)
             
-            # 청산 로직 (Trailing Stop 포함)
             bar_start = next_bar.name
             bar_end = bar_start + timedelta(hours=1)
             try: precision_candles = df_5m.loc[bar_start:bar_end]

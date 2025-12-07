@@ -42,63 +42,74 @@ class AccountManager:
 
     def check_exit_with_precision(self, candles_5m, entry, size, p_type, lev, sl_dist, tp_ratio):
         """
-        [업데이트] 수익 극대화 트레일링 스탑 로직 적용
+        [수정] 본절(BE) + 트레일링 스탑 복합 로직
         """
         if candles_5m.empty: return False, 0, "", None
 
         liq_threshold = 1.0 / float(lev)
         if p_type == 'LONG':
             liq_price = entry * (1 - liq_threshold + 0.005) 
-            current_stop_price = entry - sl_dist
+            current_sl_price = entry - sl_dist
+            tp_activation_price = entry + (sl_dist * tp_ratio)
+            be_activation_price = entry * (1 + config.BE_TRIGGER_PCT)
         else:
             liq_price = entry * (1 + liq_threshold - 0.005)
-            current_stop_price = entry + sl_dist
+            current_sl_price = entry + sl_dist
+            tp_activation_price = entry - (sl_dist * tp_ratio)
+            be_activation_price = entry * (1 - config.BE_TRIGGER_PCT)
             
-        # 트레일링 활성화 가격 (기존 고정 TP 가격)
-        trailing_activation_price = (entry + (sl_dist * tp_ratio)) if p_type == 'LONG' else (entry - (sl_dist * tp_ratio))
-        is_trailing_active = False
-        
-        # 최고점/최저점 추적
+        is_trailing = False
+        is_be_active = False
         best_price = entry 
         
         for ts, row in candles_5m.iterrows():
             curr_h = row['high']
             curr_l = row['low']
             
-            # 1. 청산 체크 (최우선)
+            # 1. 청산 체크
             if p_type == 'LONG' and curr_l <= liq_price: return True, liq_price, "LIQUIDATION", ts
             if p_type == 'SHORT' and curr_h >= liq_price: return True, liq_price, "LIQUIDATION", ts
 
-            # 2. 트레일링 스탑 로직
+            # 2. 로직 업데이트
             if p_type == 'LONG':
                 if curr_h > best_price: best_price = curr_h
                 
-                # 목표 수익률 도달 시 트레일링 활성화
-                if not is_trailing_active and curr_h >= trailing_activation_price:
-                    is_trailing_active = True
+                # 본절 체크
+                if not is_be_active and curr_h >= be_activation_price:
+                    is_be_active = True
+                    if (entry * 1.002) > current_sl_price:
+                        current_sl_price = entry * 1.002
                 
-                # 활성화 상태: 최고점 대비 0.5 * SL거리 만큼 여유를 두고 따라감
-                if is_trailing_active:
-                    new_stop = best_price - (sl_dist * 0.5)
-                    if new_stop > current_stop_price: current_stop_price = new_stop
-            
+                # 트레일링 체크
+                if not is_trailing and curr_h >= tp_activation_price:
+                    is_trailing = True
+                
+                if is_trailing:
+                    new_sl = best_price - (sl_dist * 0.5)
+                    if new_sl > current_sl_price: current_sl_price = new_sl
+
             else: # SHORT
                 if curr_l < best_price: best_price = curr_l
                 
-                if not is_trailing_active and curr_l <= trailing_activation_price:
-                    is_trailing_active = True
-                    
-                if is_trailing_active:
-                    new_stop = best_price + (sl_dist * 0.5)
-                    if new_stop < current_stop_price: current_stop_price = new_stop
+                if not is_be_active and curr_l <= be_activation_price:
+                    is_be_active = True
+                    if (entry * 0.998) < current_sl_price:
+                        current_sl_price = entry * 0.998
+                
+                if not is_trailing and curr_l <= tp_activation_price:
+                    is_trailing = True
+                
+                if is_trailing:
+                    new_sl = best_price + (sl_dist * 0.5)
+                    if new_sl < current_sl_price: current_sl_price = new_sl
 
-            # 3. Stop Loss 체크 (트레일링 포함)
-            if p_type == 'LONG' and curr_l <= current_stop_price:
-                reason = "TrailingProfit" if is_trailing_active else "StopLoss"
-                return True, current_stop_price, reason, ts
-            if p_type == 'SHORT' and curr_h >= current_stop_price:
-                reason = "TrailingProfit" if is_trailing_active else "StopLoss"
-                return True, current_stop_price, reason, ts
+            # 3. SL 실행
+            if p_type == 'LONG' and curr_l <= current_sl_price:
+                reason = "TrailingProfit" if is_trailing else ("BreakEven" if is_be_active else "StopLoss")
+                return True, current_sl_price, reason, ts
+            if p_type == 'SHORT' and curr_h >= current_sl_price:
+                reason = "TrailingProfit" if is_trailing else ("BreakEven" if is_be_active else "StopLoss")
+                return True, current_sl_price, reason, ts
         
         return False, 0, "", None
 
@@ -108,7 +119,6 @@ class AccountManager:
         entry = self.position['price']
         size = self.position['size']
         p_type = self.position['type']
-        lev = self.position['leverage']
         
         funding_rate = config.FUNDING_RATE_4H / 4 if config.MAIN_TIMEFRAME == '1h' else config.FUNDING_RATE_4H
         self.balance -= (current_close * size * funding_rate)
@@ -120,20 +130,14 @@ class AccountManager:
 
         if precision_candles is not None and not precision_candles.empty:
             is_closed, p_price, reason, p_time = self.check_exit_with_precision(
-                precision_candles, entry, size, p_type, lev, 
+                precision_candles, entry, size, p_type, self.position['leverage'], 
                 current_atr * sl_mult, tp_ratio
             )
             if is_closed:
-                exit_triggered = True
-                exit_price = p_price
-                exit_reason = reason
-                exit_time = p_time
+                exit_triggered = True; exit_price = p_price; exit_reason = reason; exit_time = p_time
         
-        # Fallback (5분봉 없을 때)
         if not exit_triggered:
             sl_dist = current_atr * sl_mult
-            
-            # Fallback은 보수적으로 고정 SL만 체크 (TP는 정밀 데이터에서만)
             if p_type == 'LONG':
                 sl_price = entry - sl_dist
                 if current_low <= sl_price:
@@ -175,7 +179,6 @@ class AccountManager:
         
         self.balance += pnl
         
-        # ROI 계산
         margin = (entry * size) / leverage
         roi = (pnl / margin) * 100 if margin > 0 else 0.0
 

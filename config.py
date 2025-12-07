@@ -25,20 +25,16 @@ COLLECT_START = '2018-01-01 00:00:00'
 COLLECT_END   = '2025-12-31 00:00:00'
 TEST_START    = '2024-01-01 00:00:00'
 
-# 재학습 주기 (14일)
 ONLINE_TRAIN_INTERVAL_DAYS = 14
 
-# 지표 설정
 INDICATOR_WINDOW = 14
 BB_WINDOW = 20
 BB_STD = 2.0
 EMA_WINDOW = 200
 
-# 라벨링 설정
 LOOK_AHEAD_STEPS = 4
 TARGET_THRESHOLD = 0.008
 
-# 모델 설정
 LSTM_WINDOW = 60
 BATCH_SIZE = 128
 TRAIN_EPOCHS = 5
@@ -52,10 +48,10 @@ XGB_PARAMS = {
     'subsample': 0.8, 'colsample_bytree': 0.8
 }
 
-# 자금 관리
+# [수정] 자금 관리: 안정형 설정 (레버리지 2배)
 ENABLE_SHORT = True
 MIN_LEVERAGE = 1
-MAX_LEVERAGE = 3
+MAX_LEVERAGE = 2 
 
 INITIAL_BALANCE = 10000.0
 SLIPPAGE = 0.0002
@@ -63,28 +59,26 @@ COMMISSION = 0.0004
 BANKRUPTCY_LIMIT = 0.1
 FUNDING_RATE_4H = 0.00005
 
-# GA 설정
 GA_SETTINGS = {
-    'population_size': 30,
-    'generations': 5,
-    'elitism': 3,
-    'mutation_rate': 0.2
+    'population_size': 40,
+    'generations': 8,
+    'elitism': 4,
+    'mutation_rate': 0.15
 }
 
-# GA 범위 설정 (수익 추구형)
+# [수정] GA 범위: 높은 진입 장벽 (0.55~)
 GA_GENE_RANGES = {
-    'entry_threshold': (0.35, 0.65), 
-    'sl_mul': (2.0, 4.5),            
-    'risk_scale': (0.01, 0.03),      
-    'tp_ratio': (1.5, 4.0) # 이 값은 이제 트레일링 시작점으로 사용됨
+    'entry_threshold': (0.55, 0.85),
+    'sl_mul': (2.5, 5.0),
+    'risk_scale': (0.01, 0.02),
+    'tp_ratio': (2.0, 5.0)
 }
 
-# 전략 상수
-GLOBAL_RISK_LIMIT = 0.05    
-BB_WIDTH_THRESHOLD = 0.0015 
-TS_TRIGGER_PCT = 0.020      
-BE_TRIGGER_PCT = 0.015      
-ADX_THRESHOLD = 20          
+# [수정] 전략 상수: 추세 기준 강화
+GLOBAL_RISK_LIMIT = 0.02
+BB_WIDTH_THRESHOLD = 0.002
+TS_TRIGGER_PCT = 0.020
+BE_TRIGGER_PCT = 0.015
 
-# [신규] 거래량 필터 임계값
-RVOL_THRESHOLD = 1.2  # 평소 거래량 대비 1.2배 이상이어야 진입
+ADX_THRESHOLD = 30          # 20 -> 30 (확실한 추세만)
+RVOL_THRESHOLD = 1.2        # 거래량 필터 기준

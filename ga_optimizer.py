@@ -6,7 +6,7 @@ from numba import njit
 from joblib import Parallel, delayed
 
 # ---------------------------------------------------------
-# [핵심] Numba JIT 컴파일된 백테스트 코어 (MDD 계산 추가)
+# [핵심] Numba JIT 컴파일된 백테스트 코어 (본절 로직 탑재)
 # ---------------------------------------------------------
 @njit(fastmath=True, nogil=True)
 def fast_backtest_core(
@@ -14,14 +14,23 @@ def fast_backtest_core(
     balance,
     entry_threshold, sl_mul, risk_scale, tp_ratio,
     min_lev, max_lev,
-    fee_rate, enable_short
+    fee_rate, enable_short,
+    be_trigger_pct # [추가] 본절 트리거 비율
 ):
     # 상태 변수
     position_type = 0 # 0: None, 1: Long, -1: Short
     entry_price = 0.0
     position_size = 0.0
     sl_price = 0.0
-    tp_price = 0.0
+    
+    # Trailing & BE 상태 관리
+    tp_activation_price = 0.0
+    is_trailing = False
+    
+    be_activation_price = 0.0
+    is_be_active = False
+    
+    best_price = 0.0
     
     init_balance = balance
     peak_balance = balance
@@ -34,7 +43,7 @@ def fast_backtest_core(
     for i in range(n - 1):
         if balance <= 0: break
         
-        # MDD 갱신 (매 봉마다)
+        # MDD 갱신
         if balance > peak_balance: peak_balance = balance
         dd = (peak_balance - balance) / peak_balance
         if dd > max_drawdown: max_drawdown = dd
@@ -47,26 +56,64 @@ def fast_backtest_core(
         next_l = lows[i+1]
         current_atr = atrs[i]
         
-        # --- 청산 로직 ---
+        # --- 청산 및 관리 로직 ---
         if position_type != 0:
             closed = False
             exit_price = 0.0
-            pnl = 0.0
             
-            # Long 청산 체크
+            # 1. Long Position 관리
             if position_type == 1:
+                if next_h > best_price: best_price = next_h
+                
+                # A. 본절(Break-Even) 체크
+                if not is_be_active and next_h >= be_activation_price:
+                    is_be_active = True
+                    # 진입가 + 0.2% (수수료 커버) 위로 손절 이동
+                    new_sl = entry_price * 1.002
+                    if new_sl > sl_price: sl_price = new_sl
+                
+                # B. 트레일링 스탑 체크
+                if not is_trailing and next_h >= tp_activation_price:
+                    is_trailing = True
+                
+                if is_trailing:
+                    sl_dist = current_atr * sl_mul
+                    # 최고가 대비 0.5배 거리로 추격
+                    new_sl = best_price - (sl_dist * 0.5)
+                    if new_sl > sl_price: sl_price = new_sl
+                    
+                # C. 손절/익절 실행 (업데이트된 SL 기준)
                 if next_l <= sl_price:
                     exit_price = sl_price; closed = True
-                elif next_h >= tp_price:
-                    exit_price = tp_price; closed = True
-            # Short 청산 체크
-            else:
+            
+            # 2. Short Position 관리
+            else: 
+                if next_l < best_price: best_price = next_l
+                
+                # A. 본절(Break-Even) 체크
+                if not is_be_active and next_l <= be_activation_price:
+                    is_be_active = True
+                    # 진입가 - 0.2% (수수료 커버) 아래로 손절 이동
+                    new_sl = entry_price * 0.998
+                    if new_sl < sl_price: sl_price = new_sl
+                    
+                # B. 트레일링 스탑 체크
+                if not is_trailing and next_l <= tp_activation_price:
+                    is_trailing = True
+                    
+                if is_trailing:
+                    sl_dist = current_atr * sl_mul
+                    # 최저가 대비 0.5배 거리로 추격
+                    new_sl = best_price + (sl_dist * 0.5)
+                    if new_sl < sl_price: sl_price = new_sl
+                    
+                # C. 손절/익절 실행
                 if next_h >= sl_price:
                     exit_price = sl_price; closed = True
-                elif next_l <= tp_price:
-                    exit_price = tp_price; closed = True
             
+            # 3. 포지션 종료 처리
             if closed:
+                pnl = 0.0
                 if position_type == 1: pnl = (exit_price - entry_price) * position_size
                 else: pnl = (entry_price - exit_price) * position_size
                 
@@ -78,13 +125,11 @@ def fast_backtest_core(
                 trade_count += 1
                 position_type = 0
                 
-                # 청산 후 MDD 다시 체크
                 if balance > peak_balance: peak_balance = balance
                 dd = (peak_balance - balance) / peak_balance
                 if dd > max_drawdown: max_drawdown = dd
 
         # --- 진입 로직 ---
-        # 포지션이 없고, AI 신호가 강할 때
         if position_type == 0 and confidence > entry_threshold:
             signal = 1 if score > 0 else -1
             if signal == -1 and not enable_short: continue
@@ -95,7 +140,6 @@ def fast_backtest_core(
             if sl_dist > 0:
                 qty_risk = risk_amt / sl_dist
                 
-                # 레버리지 계산
                 ratio = (confidence - entry_threshold) / (1.0 - entry_threshold + 1e-9)
                 ratio = min(max(ratio, 0.0), 1.0)
                 target_lev = min_lev + (ratio * (max_lev - min_lev))
@@ -112,13 +156,21 @@ def fast_backtest_core(
                         position_type = signal
                         entry_price = real_entry
                         position_size = qty
+                        best_price = real_entry
+                        
+                        # 초기 상태 설정
+                        is_trailing = False
+                        is_be_active = False
                         
                         if signal == 1:
                             sl_price = real_entry - sl_dist
-                            tp_price = real_entry + (sl_dist * tp_ratio)
+                            # TP 비율은 트레일링 시작점으로 사용
+                            tp_activation_price = real_entry + (sl_dist * tp_ratio)
+                            be_activation_price = real_entry * (1 + be_trigger_pct)
                         else:
                             sl_price = real_entry + sl_dist
-                            tp_price = real_entry - (sl_dist * tp_ratio)
+                            tp_activation_price = real_entry - (sl_dist * tp_ratio)
+                            be_activation_price = real_entry * (1 - be_trigger_pct)
 
     return balance, trade_count, max_drawdown, win_count
 
@@ -150,7 +202,7 @@ class GeneticOptimizer:
         lows = df['low'].values.astype(np.float64)
         closes = df['close'].values.astype(np.float64)
         
-        # 원본 ATR 사용 (DataProcessor 수정 필요 없이 여기서 처리 가능하면 좋음)
+        # 원본 ATR 사용
         if 'atr_origin' in df: atrs = df['atr_origin'].values.astype(np.float64)
         else: atrs = df['atr'].values.astype(np.float64)
             
@@ -161,6 +213,9 @@ class GeneticOptimizer:
         max_lev = float(config.MAX_LEVERAGE)
         enable_short = config.ENABLE_SHORT
         init_bal = float(config.INITIAL_BALANCE)
+        
+        # [수정] 본절 트리거 비율 가져오기
+        be_trigger_pct = float(config.BE_TRIGGER_PCT)
 
         pop_size = self.settings['population_size']
         population = [self.create_individual() for _ in range(pop_size)]
@@ -171,35 +226,28 @@ class GeneticOptimizer:
                     opens, highs, lows, closes, atrs, scores,
                     init_bal,
                     ind['entry_threshold'], ind['sl_mul'], ind['risk_scale'], ind['tp_ratio'],
-                    min_lev, max_lev, fee_rate, enable_short
+                    min_lev, max_lev, fee_rate, enable_short,
+                    be_trigger_pct # 인자 전달
                 ) for ind in population
             )
             
             fitness_scores = []
             for (bal, cnt, mdd, wins), ind in zip(results, population):
-                # [수정] Fitness Function: Risk-Adjusted Return
-                # 수익률이 높아도 MDD가 크면 점수 대폭 삭감
                 roi = (bal - init_bal) / init_bal
                 
-                # 페널티 조건
-                if cnt < 3: # 거래가 너무 적으면 무효
-                    fitness = -1.0
-                elif bal < init_bal * 0.8: # 원금 20% 이상 손실시 탈락
-                    fitness = -10.0
+                # 최소 거래 횟수 충족 및 파산 방지
+                if cnt < 3: fitness = -1.0
+                elif bal < init_bal * 0.8: fitness = -10.0
                 else:
-                    # Calmar Ratio 유사 지표: ROI / (MDD + 0.1)
-                    # MDD가 0일 경우를 대비해 0.05~0.1 정도 더해줌
+                    # Risk-Adjusted Return (Calmar-like)
                     fitness = roi / (mdd + 0.05)
                 
                 fitness_scores.append((fitness, ind))
             
-            # 정렬 (내림차순)
             fitness_scores.sort(key=lambda x: x[0], reverse=True)
             
-            # 엘리트 선택
             next_gen = [x[1] for x in fitness_scores[:self.settings['elitism']]]
             
-            # 다음 세대 생성
             while len(next_gen) < pop_size:
                 p1 = random.choice(fitness_scores[:int(pop_size/2)])[1]
                 p2 = random.choice(fitness_scores[:int(pop_size/2)])[1]
@@ -209,5 +257,4 @@ class GeneticOptimizer:
                 
             population = next_gen
             
-        # 최적해 반환
         return fitness_scores[0][1]
