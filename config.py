@@ -1,84 +1,96 @@
-# config.py
 import os
+from datetime import datetime
 
+# ---------------------------------------------------------
+# [System] 경로 및 세션 설정
+# ---------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
-MODEL_DIR = os.path.join(BASE_DIR, 'models')
-LOG_DIR = os.path.join(BASE_DIR, 'logs')
+LOG_BASE_DIR = os.path.join(BASE_DIR, 'logs')
+MODEL_BASE_DIR = os.path.join(BASE_DIR, 'models_saved')
 
-for d in [DATA_DIR, MODEL_DIR, LOG_DIR]:
-    if not os.path.exists(d): os.makedirs(d)
+# 디렉토리 자동 생성
+for d in [DATA_DIR, LOG_BASE_DIR, MODEL_BASE_DIR]:
+    os.makedirs(d, exist_ok=True)
 
-LOG_FILE = os.path.join(LOG_DIR, 'debug_trade.log')
-RESULT_FILE = os.path.join(LOG_DIR, 'backtest_result.csv')
+class SessionManager:
+    def __init__(self):
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # [수정] 변수명 통일 (session_dir -> log_dir)
+        # 로그와 모델 경로를 분리하여 관리
+        self.log_dir = os.path.join(LOG_BASE_DIR, self.session_id)
+        self.model_dir = os.path.join(MODEL_BASE_DIR, self.session_id)
+        self.tensorboard_dir = os.path.join(self.log_dir, "tb_logs")
 
-EXCHANGE_NAME = 'binance'
-TARGET_SYMBOLS = ['BTC/USDT']
+    def create(self):
+        # [수정] __init__에서 정의한 변수명(log_dir) 사용
+        os.makedirs(self.log_dir, exist_ok=True)
+        os.makedirs(self.model_dir, exist_ok=True)
+        os.makedirs(self.tensorboard_dir, exist_ok=True)
+        
+        return {
+            'id': self.session_id,
+            'root': self.log_dir,       # 로그 저장소 (session_dir 대신 log_dir 사용)
+            'tb': self.tensorboard_dir, # 텐서보드
+            'model': self.model_dir,    # 모델 저장소
+            'log_file': os.path.join(self.log_dir, 'system.log') # 통합 로그 파일
+        }
 
-# 타임프레임
-MAIN_TIMEFRAME = '1h'
-AUX_TIMEFRAME = '4h'
-PRECISION_TIMEFRAME = '5m'
+# ---------------------------------------------------------
+# [Data] 데이터 및 지표 설정
+# ---------------------------------------------------------
+SYMBOL = 'BTC/USDT'
+TIMEFRAME_MAIN = '1h'
+TIMEFRAME_AUX = '4h'
+TIMEFRAME_PRECISION = '5m'
 
-# 데이터 기간
-COLLECT_START = '2018-01-01 00:00:00'
-COLLECT_END   = '2025-12-31 00:00:00'
-TEST_START    = '2024-01-01 00:00:00'
+DATE_START = '2019-01-01 00:00:00'
+DATE_END   = '2025-12-31 00:00:00'
+TEST_SPLIT_DATE = '2024-01-01 00:00:00'
 
-ONLINE_TRAIN_INTERVAL_DAYS = 14
-
+# ML Feature 설정
 INDICATOR_WINDOW = 14
-BB_WINDOW = 20
-BB_STD = 2.0
-EMA_WINDOW = 200
+LOOK_AHEAD_STEPS = 1
+TARGET_THRESHOLD = 0.005
 
-LOOK_AHEAD_STEPS = 4
-TARGET_THRESHOLD = 0.008
+# 학습에서 제외할 컬럼 (Raw Data & Target)
+EXCLUDE_COLS = [
+    'timestamp', 'open', 'high', 'low', 'close', 'volume', 
+    'target_cls', 'target_val' 
+]
 
-LSTM_WINDOW = 60
-BATCH_SIZE = 128
-TRAIN_EPOCHS = 5
-W_XGB = 0.5
-W_LSTM = 0.5
+# ---------------------------------------------------------
+# [ML] Supervised Learning (Teacher)
+# ---------------------------------------------------------
+ML_SEQ_LEN = 60
+ML_EPOCHS = 30  # 에포크 30으로 증가
+ML_BATCH_SIZE = 64
 
-XGB_PARAMS = {
-    'n_estimators': 100, 'max_depth': 5, 'learning_rate': 0.03,
-    'tree_method': 'hist', 'device': 'cuda', 
-    'objective': 'multi:softprob', 'eval_metric': 'mlogloss',
-    'subsample': 0.8, 'colsample_bytree': 0.8
+# ---------------------------------------------------------
+# [RL] Reinforcement Learning (Student)
+# ---------------------------------------------------------
+RL_TOTAL_TIMESTEPS = 1_000_000
+
+# PPO 네트워크 및 파라미터 고도화
+RL_PPO_PARAMS = {
+    'learning_rate': 3e-4,
+    'n_steps': 2048,
+    'batch_size': 512,
+    'n_epochs': 10,
+    'gamma': 0.99,
+    'gae_lambda': 0.95,
+    'clip_range': 0.2,
+    'ent_coef': 0.01,
+    'policy_kwargs': dict(
+        net_arch=dict(pi=[256, 256], vf=[256, 256])
+    )
 }
 
-# [수정] 자금 관리: 안정형 설정 (레버리지 2배)
-ENABLE_SHORT = True
-MIN_LEVERAGE = 1
-MAX_LEVERAGE = 2 
-
+# ---------------------------------------------------------
+# [Trading] 매매 로직 설정
+# ---------------------------------------------------------
 INITIAL_BALANCE = 10000.0
-SLIPPAGE = 0.0002
-COMMISSION = 0.0004
-BANKRUPTCY_LIMIT = 0.1
-FUNDING_RATE_4H = 0.00005
-
-GA_SETTINGS = {
-    'population_size': 40,
-    'generations': 8,
-    'elitism': 4,
-    'mutation_rate': 0.15
-}
-
-# [수정] GA 범위: 높은 진입 장벽 (0.55~)
-GA_GENE_RANGES = {
-    'entry_threshold': (0.55, 0.85),
-    'sl_mul': (2.5, 5.0),
-    'risk_scale': (0.01, 0.02),
-    'tp_ratio': (2.0, 5.0)
-}
-
-# [수정] 전략 상수: 추세 기준 강화
-GLOBAL_RISK_LIMIT = 0.02
-BB_WIDTH_THRESHOLD = 0.002
-TS_TRIGGER_PCT = 0.020
-BE_TRIGGER_PCT = 0.015
-
-ADX_THRESHOLD = 30          # 20 -> 30 (확실한 추세만)
-RVOL_THRESHOLD = 1.2        # 거래량 필터 기준
+LEVERAGE = 2
+FEE_RATE = 0.0004 # 0.04%
+SLIPPAGE = 0.0002 # 0.02%
