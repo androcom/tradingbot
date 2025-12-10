@@ -1,8 +1,39 @@
 import os
+import multiprocessing
 from datetime import datetime
 
 # ---------------------------------------------------------
-# [System] 경로 및 세션 설정
+# [System] 하드웨어 및 시스템 자동 설정 (중앙 제어)
+# ---------------------------------------------------------
+def get_optimal_cpu_cores():
+    try:
+        # 전체 코어의 80% 정도만 사용 (OS 안정성 위해 여유 둠)
+        # 최소 2개, 최대 전체-1개
+        cores = multiprocessing.cpu_count()
+        return max(2, cores - 1) 
+    except:
+        return 2
+
+DETECTED_CORES = get_optimal_cpu_cores()
+
+SYSTEM = {
+    # 1. 메인 학습(Main)용 장치 설정
+    'MAIN_ML_DEVICE': 'cuda',      # XGBoost/LSTM
+    'MAIN_RL_DEVICE': 'cuda',      # PPO
+
+    # 2. 최적화(Optimization)용 장치 설정
+    'OPT_TEACHER_DEVICE': 'cuda',
+    'OPT_LOGIC_DEVICE': 'cuda',
+
+    # 3. 병렬 프로세스 개수 (Optuna n_jobs)
+    'NUM_WORKERS': DETECTED_CORES, 
+    
+    # 4. 기타
+    'SUPPRESS_WARNINGS': True       # 경고 메시지 차단
+}
+
+# ---------------------------------------------------------
+# [Path] 경로 설정
 # ---------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
@@ -53,24 +84,24 @@ EXCLUDE_COLS = [
 # ---------------------------------------------------------
 # [Feature] 지표 및 타겟
 # ---------------------------------------------------------
-INDICATOR_WINDOW = 45
-LOOK_AHEAD_STEPS = 1
-TARGET_THRESHOLD = 0.00233
+INDICATOR_WINDOW = 75          
+LOOK_AHEAD_STEPS = 1           
+TARGET_THRESHOLD = 0.00373     
 
 # ---------------------------------------------------------
 # [Model] 모델 하이퍼파라미터
 # ---------------------------------------------------------
-# 1. XGBoost (Teacher) - Optuna 최적값
+# XGBoost: device 설정은 호출하는 쪽에서 config.SYSTEM을 참조하여 주입
 XGB_PARAMS = {
-    'n_estimators': 400,
-    'max_depth': 3,            # 깊이가 얕음 -> 과적합 방지 및 일반화 성능 우수
-    'learning_rate': 0.061,
+    'n_estimators': 250,
+    'max_depth': 3,
+    'learning_rate': 0.0565,
     'n_jobs': -1,
     'random_state': 42,
-    'eval_metric': 'mlogloss'
+    'eval_metric': 'mlogloss',
 }
 
-# 2. LSTM (Teacher)
+# LSTM
 ML_SEQ_LEN = 60
 ML_EPOCHS = 150
 ML_BATCH_SIZE = 256
@@ -80,7 +111,7 @@ LSTM_PARAMS = {
     'dropout': 0.3
 }
 
-# 3. PPO (Student)
+# PPO
 RL_TOTAL_TIMESTEPS = 10_000_000 
 RL_PPO_PARAMS = {
     'learning_rate': 2e-4,
@@ -97,7 +128,7 @@ RL_PPO_PARAMS = {
 }
 
 # ---------------------------------------------------------
-# [Trading] 거래 규칙 & 리스크 관리
+# [Trading] 거래 규칙
 # ---------------------------------------------------------
 INITIAL_BALANCE = 10000.0
 MAX_LEVERAGE = 5 
@@ -106,14 +137,11 @@ SLIPPAGE = 0.0002
 
 TRADING_RULES = {
     'trend_window': 200,       
-    'sl_atr_multiplier': 3.0,  # 윈도우가 짧아졌으므로(15), 손절폭은 3.0으로 넉넉히 줌 (노이즈 방어)
-    'risk_per_trade': 0.01,    # 거래당 1% 리스크 고정
-
+    'sl_atr_multiplier': 2.0,  
+    'risk_per_trade': 0.01,    
+    'tp_trigger_atr': 2.2,
+    'trailing_gap_atr': 3.0,   
     'min_trade_amount': 10.0,
     'funding_rate_hourly': 0.000025,
-    'scale_down_factor': 0.5,   # 역추세일 때 50% 비중으로 진입 (공격성 약간 상향)
-
-    # [신규 최적값 적용] 익절 및 트레일링 설정
-    'tp_trigger_atr': 1.3,     # 1.3 ATR 수익 시 본절 발동
-    'trailing_gap_atr': 1.6    # 고점 대비 1.6 ATR 간격 유지
+    'scale_down_factor': 0.5
 }

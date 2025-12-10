@@ -19,9 +19,10 @@ from models.ml_models import HybridLearner
 from models.rl_env import CryptoEnv
 from strategies.trading_core import TradingCore
 
+# 경고 무시 설정
 warnings.filterwarnings("ignore", category=UserWarning, module="stable_baselines3")
 
-# [수정] RL 로그 콜백 (Running Average로 버그 수정)
+# [수정] RL 로그 콜백
 class RLLoggingCallback(BaseCallback):
     def __init__(self, verbose=0):
         super(RLLoggingCallback, self).__init__(verbose)
@@ -33,7 +34,6 @@ class RLLoggingCallback(BaseCallback):
         self.logger_obj.info(f"   [RL_TRAIN] Training STARTED... (Total Timesteps: {self.model._total_timesteps})")
 
     def _on_step(self) -> bool:
-        # 매 스텝마다 최신 정보가 있으면 업데이트해둠
         if len(self.model.ep_info_buffer) > 0:
             self.last_mean_reward = np.mean([ep_info['r'] for ep_info in self.model.ep_info_buffer])
             self.last_mean_length = np.mean([ep_info['l'] for ep_info in self.model.ep_info_buffer])
@@ -42,6 +42,7 @@ class RLLoggingCallback(BaseCallback):
     def _on_training_end(self) -> None:
         self.logger_obj.info(f"   [RL_TRAIN] Training FINISHED | Final Ep_Rew_Mean: {self.last_mean_reward:.2f} | Final Ep_Len_Mean: {self.last_mean_length:.2f}")
 
+# [핵심 클래스] PipelineTrainer
 class PipelineTrainer:
     def __init__(self, session_paths):
         self.paths = session_paths
@@ -54,7 +55,6 @@ class PipelineTrainer:
         self.logger.info(msg)
         
     def log_parameters(self):
-        """[수정] Config의 모든 파라미터를 로그에 출력"""
         self.log("[CONFIG] FULL CONFIGURATION:")
         for attr in dir(config):
             if not attr.startswith("__"):
@@ -85,17 +85,15 @@ class PipelineTrainer:
             self.log("!! [Error] No data found.")
             return
 
-        # 2. Scaler Fit (Train Only)
+        # 2. Scaler Fit
         train_idx_mask = full_df.index < config.TEST_SPLIT_DATE
         feature_cols = [c for c in full_df.columns if c not in config.EXCLUDE_COLS]
-        
         self.log("   - Fitting Scaler on Train Data...")
         self.scaler.fit(full_df.loc[train_idx_mask, feature_cols])
 
-        # 3. Generate Signals
+        # 3. Signals
         self.log("\n[Phase 2 & 3] Generating 'Honest' ML Signals (Walk-Forward)...")
         full_df['ml_signal'] = 0.0
-        
         train_df = full_df[train_idx_mask].copy()
         test_df = full_df[~train_idx_mask].copy()
         
@@ -133,10 +131,9 @@ class PipelineTrainer:
         min_len_test = min(len(test_indices), len(test_signals))
         full_df.loc[test_indices[:min_len_test], 'ml_signal'] = test_signals[:min_len_test]
         full_df['ml_signal'] = full_df['ml_signal'].fillna(0)
-        
         self.log(f"   - Signal Generation Complete.")
 
-        # 4. Train RL
+        # 4. RL Training
         self.log("\n[Phase 4] Training RL Agent (Student)...")
         self._train_rl(full_df[train_idx_mask])
 
@@ -156,16 +153,11 @@ class PipelineTrainer:
     def _prepare_ml_inputs(self, df, features, is_training=False):
         data_scaled = self.scaler.transform(df[features])
         window_size = config.ML_SEQ_LEN
-        
-        if len(data_scaled) <= window_size:
-            return np.array([]), np.array([]), np.array([])
-
+        if len(data_scaled) <= window_size: return np.array([]), np.array([]), np.array([])
         X_seq = np.lib.stride_tricks.sliding_window_view(data_scaled, window_shape=(window_size, len(features)))
         X_seq = X_seq.squeeze(axis=1)
         if X_seq.ndim == 4: X_seq = X_seq[:, 0, :, :]
-             
         X_flat = data_scaled[window_size:]
-        
         if 'target_cls' in df.columns and is_training:
             y = df['target_cls'].values[window_size:]
             min_len = min(len(X_seq), len(X_flat), len(y))
@@ -174,42 +166,26 @@ class PipelineTrainer:
             min_len = min(len(X_seq), len(X_flat))
             return X_flat[:min_len], X_seq[:min_len], None
 
-    def _attach_ml_signal(self, df, features):
-        # Already handled in run_all logic
-        return df
-
     def _train_rl(self, df):
-        def make_env():
-            return CryptoEnv(df, TradingCore(), precision_df=None, debug=False)
-
+        def make_env(): return CryptoEnv(df, TradingCore(), precision_df=None, debug=False)
         n_envs = self._get_optimal_n_envs()
         self.log(f"   - Parallel Environments: {n_envs}")
-
         env = SubprocVecEnv([make_env for _ in range(n_envs)])
         env = VecMonitor(env)
         env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10., gamma=config.RL_PPO_PARAMS['gamma'])
         
-        checkpoint_callback = CheckpointCallback(
-            save_freq=100000, save_path=self.paths['model'], name_prefix='rl_model'
-        )
+        checkpoint_callback = CheckpointCallback(save_freq=100000, save_path=self.paths['model'], name_prefix='rl_model')
         logging_callback = RLLoggingCallback()
 
         model = PPO(
             "MlpPolicy", 
             env, 
-            verbose=1, 
+            verbose=0, 
             tensorboard_log=self.paths['tb'], 
-            device='cuda',
+            device=config.SYSTEM['MAIN_RL_DEVICE'], # [수정] Config 사용
             **config.RL_PPO_PARAMS
         )
-
-        model.learn(
-            total_timesteps=config.RL_TOTAL_TIMESTEPS, 
-            callback=[checkpoint_callback, logging_callback],
-            tb_log_name="PPO_Main",
-            progress_bar=True
-        )
-        
+        model.learn(total_timesteps=config.RL_TOTAL_TIMESTEPS, callback=[checkpoint_callback, logging_callback], tb_log_name="PPO_Main", progress_bar=True)
         model.save(os.path.join(self.paths['model'], "final_agent"))
         env.save(os.path.join(self.paths['model'], "vec_normalize.pkl"))
         env.close()
@@ -217,41 +193,32 @@ class PipelineTrainer:
     def _run_backtest(self, df, precision_df):
         env = CryptoEnv(df, TradingCore(), precision_df=precision_df, debug=True)
         dummy_env = DummyVecEnv([lambda: env])
-        
         vec_norm_path = os.path.join(self.paths['model'], "vec_normalize.pkl")
         if os.path.exists(vec_norm_path):
             norm_env = VecNormalize.load(vec_norm_path, dummy_env)
             norm_env.training = False 
             norm_env.norm_reward = False
-        else:
-            norm_env = dummy_env
+        else: norm_env = dummy_env
 
         model = PPO.load(os.path.join(self.paths['model'], "final_agent"))
-        
         obs = norm_env.reset()
         done = [False]
-        
         history_dates = []
         history_bal = []
         history_price = []
-        
         timestamps = df.index.to_numpy()
         prices = df['close'].to_numpy()
         total_steps = len(df)
-        
         current_step = 0
         final_recorded_bal = config.INITIAL_BALANCE
 
         while not done[0]:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, infos = norm_env.step(action)
-            
             if done[0]:
                 info = infos[0]
-                if 'final_balance' in info:
-                    final_recorded_bal = info['final_balance']
+                if 'final_balance' in info: final_recorded_bal = info['final_balance']
                 break
-
             if current_step < total_steps:
                 try:
                     ts = timestamps[current_step]
@@ -261,14 +228,13 @@ class PipelineTrainer:
                     history_dates.append(ts)
                     history_bal.append(bal)
                     history_price.append(price)
-                except IndexError:
-                    pass
+                except IndexError: pass
             current_step += 1
 
         save_path = os.path.join(self.paths['root'], 'backtest_result.png')
         self._plot_backtest(history_dates, history_bal, history_price, save_path)
         
-        # [추가] 거래 기록 CSV 저장
+        # CSV 저장
         real_env = norm_env.envs[0]
         if real_env.logic.history:
             trade_df = pd.DataFrame(real_env.logic.history)
