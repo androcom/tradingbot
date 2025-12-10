@@ -1,32 +1,31 @@
-# --- Core AI Frameworks (Windows GPU Native Support) ---
-# TensorFlow 2.10 is the LAST version to support native Windows GPU
+# PyTorch GPU Source (CUDA 11.8)
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+# PyTorch (CUDA Version)
+torch==2.1.2+cu118
+
+# TensorFlow (Windows Native GPU Last Support)
 tensorflow==2.10.0
 
-# Numpy version compatible with both TF 2.10 and PyTorch
+# Numpy (Compatibility)
 numpy==1.23.5
 
-# --- PyTorch (Specific CUDA 11.8 version will be handled by command) ---
-# We list standard names here, but install command is key.
-torch
-torchvision
-torchaudio
-
 # --- Reinforcement Learning ---
-stable-baselines3[extra]>=2.0.0
-gymnasium>=0.28.1
-shimmy>=0.2.1
+stable-baselines3[extra]>=2.2.1
+gymnasium>=0.29.1
+shimmy>=1.3.0
 
 # --- Data Processing & Analysis ---
-pandas>=1.5.0
-scikit-learn>=1.2.0
-matplotlib>=3.7.0
-ta>=0.10.0
-ccxt>=4.0.0
-pyarrow>=11.0.0  # For .parquet file support
+pandas>=2.0.0
+scikit-learn>=1.3.0
+matplotlib>=3.8.0
+ta>=0.11.0
+ccxt>=4.1.0
+pyarrow>=14.0.0
 
 # --- Tools & Optimization ---
 tensorboard>=2.10.0
-xgboost>=1.7.0
-joblib>=1.2.0
-optuna>=3.0.0
-openpyxl>=3.1.0  # Optional for Excel export
+xgboost>=2.0.0
+joblib>=1.3.0
+optuna>=3.5.0
+openpyxl>=3.1.0

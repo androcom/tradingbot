@@ -1,15 +1,18 @@
 import sys
 import os
+import config
 import logging
 import webbrowser
-# [잡음 제거 1] TensorFlow 로그 레벨 조정 (Warning 이상만 출력)
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
+
+# 1. 텐서플로우 및 시스템 로그 레벨 조정 (최우선)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 
-import torch # PyTorch 먼저 임포트 (DLL 충돌 방지)
+import torch
 import tensorflow as tf
 from tensorflow.keras import mixed_precision
 
+# 성능 최적화: Mixed Precision
 policy = mixed_precision.Policy('mixed_float16')
 mixed_precision.set_global_policy(policy)
 
@@ -18,15 +21,15 @@ from config import SessionManager
 from strategies.pipeline_trainer import PipelineTrainer
 
 def setup_global_logging(log_file):
+    # 루트 로거 초기화
     root = logging.getLogger()
-    if root.handlers:
-        for handler in root.handlers:
-            root.removeHandler(handler)
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
             
-    # 포맷을 깔끔하게 변경 (시간 | 레벨 | 메시지)
+    # 포맷 설정
     formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
 
-    # 파일 핸들러 (모든 중요 로그 저장)
+    # 파일 핸들러
     file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
     file_handler.setFormatter(formatter)
     
@@ -40,25 +43,43 @@ def setup_global_logging(log_file):
         force=True
     )
 
-    # [잡음 제거 2] TensorBoard(Werkzeug) 및 기타 라이브러리 로그 차단
-    logging.getLogger('werkzeug').setLevel(logging.ERROR)
-    logging.getLogger('tensorflow').setLevel(logging.ERROR)
-    logging.getLogger('h5py').setLevel(logging.ERROR)
+def silence_annoying_loggers():
+    """소음을 유발하는 로거들의 입을 강제로 막는 함수"""
+    noisy_loggers = [
+        'werkzeug', 'tensorboard', 'tensorflow', 
+        'h5py', 'matplotlib', 'absl', 'urllib3', 'requests'
+    ]
+    
+    for name in noisy_loggers:
+        logger = logging.getLogger(name)
+        # 1. 레벨을 CRITICAL보다 높은 수준으로 설정 (아무것도 출력 안 함)
+        logger.setLevel(logging.CRITICAL + 1)
+        # 2. 전파 차단
+        logger.propagate = False
+        # 3. 기존 핸들러 모두 제거
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
 
 def launch_tensorboard(log_dir):
     try:
-        # TensorBoard 자체 로그도 숨김
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+        # [1차 차단]
+        silence_annoying_loggers()
+        
         tb = program.TensorBoard()
-        tb.configure(argv=[None, '--logdir', log_dir, '--port', '6006'])
+        # reload_interval을 크게 설정하여 로그 갱신 빈도 줄임
+        tb.configure(argv=[None, '--logdir', log_dir, '--port', '6006', '--reload_interval', '300'])
         url = tb.launch()
-        logging.info(f">> TensorBoard started: {url}") # 깔끔하게 한 줄만
+        
+        # [2차 차단 - 핵심] 텐서보드 실행 직후 다시 한번 로거를 죽임 (재설정 방지)
+        silence_annoying_loggers()
+        
+        # 접속 로그가 아닌 단순 안내 메시지만 출력
+        logging.info(f">> TensorBoard started: {url}")
         webbrowser.open(url)
     except Exception as e:
         logging.warning(f">> TB Launch failed: {e}")
 
 if __name__ == "__main__":
-    # GPU 정보도 간략하게 한 줄로
     gpus = tf.config.list_physical_devices('GPU')
     gpu_msg = f"GPU: {gpus[0].name}" if gpus else "GPU: None"
 
@@ -67,11 +88,14 @@ if __name__ == "__main__":
     
     setup_global_logging(paths['log_file'])
     
+    # 시작 전에도 차단 실행
+    silence_annoying_loggers()
+    
     logging.info(f"{'='*50}")
     logging.info(f" SESSION: {paths['id']} | {gpu_msg}")
     logging.info(f"{'='*50}")
 
-    launch_tensorboard(paths['tb'])
+    launch_tensorboard(config.LOG_BASE_DIR)
 
     trainer = PipelineTrainer(paths)
     trainer.run_all()

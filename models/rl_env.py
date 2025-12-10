@@ -14,7 +14,7 @@ class CryptoEnv(gym.Env):
         self.logic = trading_logic # strategies/trading_core.py의 인스턴스
         self.debug = debug
         
-        # RL 학습에 사용할 Feature Columns (설정에서 제외된 컬럼 뺌)
+        # RL 학습에 사용할 Feature Columns
         self.features = [c for c in df.columns if c not in config.EXCLUDE_COLS]
         
         # Action Space: 0:Hold, 1:Long, 2:Short, 3:Close
@@ -35,7 +35,7 @@ class CryptoEnv(gym.Env):
         super().reset(seed=seed)
         
         self.current_step = 0
-        self.logic.reset() # 자산 및 포지션 초기화
+        self.logic.reset() # Account Reset
         
         self.returns_buffer.clear()
         self.max_equity = config.INITIAL_BALANCE
@@ -43,114 +43,100 @@ class CryptoEnv(gym.Env):
         return self._get_obs(), {}
 
     def _get_obs(self):
-        """현재 상태(Observation) 생성"""
-        # 1. Market Data
         row = self.df.iloc[self.current_step]
         market_obs = row[self.features].values.astype(np.float32)
         
-        # 2. Position Data
-        # 정규화를 위해 가격 정보는 비율로 변환하거나 스케일링이 필요하지만,
-        # 여기서는 모델(PPO)의 VecNormalize가 처리하도록 Raw값 전달
+        # [수정] 절대 가격(entry_price) 대신 '진입가 대비 현재가 비율' 사용
         if self.logic.position:
             pos_size = float(self.logic.position['size'])
+            # Entry Price 자체는 학습에 방해됨 (값이 너무 큼). 
+            # 대신 현재가/진입가 비율을 사용.
             entry_price = float(self.logic.position['price'])
-            # 현재 가격 기준 미실현 수익률
+            price_ratio = (row['close'] / entry_price) if entry_price > 0 else 1.0
             pnl_pct = self.logic.get_unrealized_pnl_pct(row['close'])
         else:
             pos_size = 0.0
-            entry_price = 0.0
+            price_ratio = 1.0
             pnl_pct = 0.0
             
-        pos_obs = np.array([pos_size, entry_price, pnl_pct], dtype=np.float32)
+        pos_obs = np.array([pos_size, price_ratio, pnl_pct], dtype=np.float32)
         
         return np.concatenate([market_obs, pos_obs])
 
     def step(self, action):
         # 1. 현재 스텝 데이터 확인
         row = self.df.iloc[self.current_step]
-        current_ts = row.name # Index must be DatetimeIndex
+        current_ts = row.name
         current_close = row['close']
         
         # 이전 자산 가치 (보상 계산용)
+        # Unrealized PnL을 포함한 총 자산(Equity) 기준
         prev_equity = self.logic.balance + self.logic.get_unrealized_pnl(current_close)
         
-        # 2. 5분봉 정밀 데이터 매칭 (Precision Slicing)
+        # 2. 5분봉 정밀 데이터 매칭
         precision_candles = None
         if self.precision_df is not None:
             try:
-                # 현재 1시간봉의 시작 시간 ~ 끝 시간 (59분)
                 end_ts = current_ts + pd.Timedelta(minutes=59)
-                # pandas의 시간 인덱스 슬라이싱 활용 (빠름)
                 precision_candles = self.precision_df.loc[current_ts:end_ts]
             except KeyError:
-                pass # 데이터가 없으면 Fallback 로직(TradingCore 내부) 사용
+                pass 
 
         # 3. 매매 로직 실행 (Trading Core 위임)
-        # 여기서 5분봉 데이터를 넘겨주어 고가/저가 터치 여부를 정밀 계산
         self.logic.process_step(action, row, current_ts, precision_candles)
         
         # 4. 자산 가치 재평가
         curr_equity = self.logic.balance + self.logic.get_unrealized_pnl(current_close)
         
-        # 5. 보상 계산
+        # 5. 보상 계산 (개선된 함수 호출)
         reward = self._calculate_reward(prev_equity, curr_equity)
         
         # 6. 종료 조건 체크
         self.current_step += 1
         terminated = False
         truncated = False
+        info = {}
         
         # 데이터 끝 도달
         if self.current_step >= len(self.df) - 1:
             terminated = True
+            info['final_balance'] = curr_equity # 백테스트 그래프용
             
-        # 파산 체크 (원금의 40% 미만이면 종료)
+        # 파산 체크 (원금의 40% 미만)
         if curr_equity < config.INITIAL_BALANCE * 0.4:
             terminated = True
-            reward = -10.0 # 과도한 -100 대신 적절한 페널티 부여
+            reward = -10.0 # 파산 페널티
+            info['final_balance'] = curr_equity
         
-        return self._get_obs(), reward, terminated, truncated, {}
+        return self._get_obs(), reward, terminated, truncated, info
 
     def _calculate_reward(self, prev_equity, curr_equity):
-        """
-        [보상 함수 로직]
-        1. Log Returns: 복리 효과 반영
-        2. Volatility Penalty: 변동성이 크면 보상 차감 (Sortino 스타일)
-        3. Drawdown Penalty: 최고점 대비 하락폭 페널티
-        """
-        if prev_equity <= 0: return 0
+        # 1. 수익률 보상 (로그 수익률)
+        # 스케일링을 키워서(100 -> 200) 작은 수익도 크게 느끼게 함
+        log_return = np.log(curr_equity / prev_equity) if prev_equity > 0 else 0
+        step_reward = log_return * 200 
         
-        # 로그 수익률 사용
-        log_return = np.log(curr_equity / prev_equity)
-        self.returns_buffer.append(log_return)
-        
-        # 1. 기본 보상 (수익률 스케일링)
-        step_reward = log_return * 100 
-        
-        # 2. 변동성 페널티 (안정성 추구)
-        if len(self.returns_buffer) > 5:
-            std = np.std(self.returns_buffer)
-            # 변동성이 클수록 페널티 (수익이 나더라도 불안정하면 점수 깎음)
-            step_reward -= (std * 0.1)
-            
-        # 3. MDD 페널티 (Drawdown 관리)
+        # 2. [수정] Winning Bonus 강화 (수익 나면 더 큰 칭찬)
+        if log_return > 0:
+            step_reward *= 2.0  # 1.5 -> 2.0 (수익에 대한 갈망 유도)
+
+        # 3. [삭제] 변동성 페널티 제거
+        # 초반 학습에는 방해만 됩니다. 단순하게 갑시다.
+        # if len(self.returns_buffer) > 10: ... (삭제)
+
+        # 4. [완화] MDD 페널티 대폭 축소
+        # 고점 대비 하락에 대한 공포를 줄여줍니다.
         if curr_equity > self.max_equity:
             self.max_equity = curr_equity
+            step_reward += 0.5 # 고점 갱신 보너스 추가 (신규)
         
+        # Drawdown 페널티는 정말 심각할 때만(10% 이상) 부여
         drawdown = (self.max_equity - curr_equity) / self.max_equity
-        if drawdown > 0.05: # 5% 이상 하락 시 추가 페널티
-            step_reward -= (drawdown * 0.2)
+        if drawdown > 0.1: 
+            step_reward -= (drawdown * 1.0) # 계수 완화
 
-        # 4. Reward Clipping (학습 안정화)
-        # 지나치게 큰 보상/벌점은 PPO 학습을 방해하므로 자름
-        step_reward = np.clip(step_reward, -1.0, 1.0)
-        
-        return step_reward
+        # 5. [신규] '버티기' 보상 (Time Survival Reward)
+        # 깡통 차지 않고 살아있는 것만으로도 아주 작은 점수를 줌
+        step_reward += 0.001 
 
-    def render(self, mode='human'):
-        """간단한 상태 출력"""
-        if self.logic.position:
-            print(f"Step: {self.current_step} | Bal: {self.logic.balance:.2f} | "
-                  f"Pos: {self.logic.position['type']} ({self.logic.get_unrealized_pnl_pct(0)*100:.2f}%)")
-        else:
-            print(f"Step: {self.current_step} | Bal: {self.logic.balance:.2f} | Pos: None")
+        return np.clip(step_reward, -5.0, 5.0)
